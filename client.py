@@ -3084,6 +3084,8 @@ def _tui_enabled(args):
         return True
     if getattr(args, "debug", False):
         return False
+    if os.environ.get("TERM", "").lower() in ("dumb", "unknown"):
+        return False
     try:
         return bool(sys.stdout.isatty())
     except Exception:
@@ -3196,8 +3198,12 @@ def run_headless(args):
                 except Exception:
                     username = None  # corrupt token file; normal auth handling will decide
             dashboard = TerminalDashboard()
-            dashboard.update_context(username=username or "saved session", server=args.server)
-            dashboard.start()
+            if getattr(getattr(dashboard, "console", None), "legacy_windows", False) and not getattr(args, "tui", False):
+                log.warning("Legacy Windows console detected; using plain logs. Use Windows Terminal or enable VT processing for the dashboard.")
+                dashboard = None
+            if dashboard is not None:
+                dashboard.update_context(username=username or "saved session", server=args.server)
+                dashboard.start()
         except Exception as exc:
             log.warning(f"Terminal dashboard unavailable ({exc}); using plain logs.")
             dashboard = None
