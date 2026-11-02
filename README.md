@@ -105,8 +105,8 @@ While the dashboard is running:
 
 - `s` stops training at the next safe step; press `s` again to start a new round.
 - `q` or `Ctrl+C` quits.
-- The layout reflows when the terminal is resized and works inside `tmux` or `screen`
-  (both keys are ordinary characters, not multiplexer prefixes).
+- The layout reflows when the terminal is resized. `s` and `q` are ordinary characters,
+  so they do not conflict with `tmux`/`screen` prefix bindings.
 - The dashboard needs a normal UTF-8 terminal. It falls back to plain logs on
   `TERM=dumb`/`unknown` and on legacy Windows consoles without VT support; use
   `--tui` to override the auto-fallback. Modern Windows Terminal is the
@@ -121,8 +121,10 @@ crowdgpt --register --user NAME --email you@example.com
 crowdgpt --register --user NAME --email you@example.com --password '...'
 ```
 
-Registration saves the session token in `checkpoints/auth_token.json`, so the next
-`crowdgpt --headless` run can reuse it. Registration exits without training.
+Prefer the hidden prompt. Passing `--password` is intended for automation and may
+leave the value in shell history or the process list. Registration saves the session
+token in `checkpoints/auth_token.json`, so the next `crowdgpt --headless` run can
+reuse it. Registration exits without training.
 
 `crowdgpt --help` lists all options. A few settings can also be set through environment variables:
 

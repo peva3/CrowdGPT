@@ -2421,7 +2421,7 @@ class Api:
             try: _save_auth_token(self.server_url, u, tok, remember)
             except Exception: pass
             self.emit('login_success', {'username': u})
-        else: self.emit('login_error', {'code': err or 'register_failed'})
+        else: self.emit('login_error', {'code': _GUI_REGISTER_CODES.get(err, err or 'register_failed')})
 
     def login_anon(self):
         self.auth_token = None; self.username = "anonymous"
@@ -2589,20 +2589,6 @@ def _bar_text(percent, width):
     bar.append("░" * (usable - filled), style="grey37")
     return bar
 
-def _sparkline_text(values, width):
-    if not values:
-        return Text("—", style="dim")
-    points = list(values)[-max(8, width):]
-    low, high = min(points), max(points)
-    span = (high - low) or 1.0
-    blocks = "▁▂▃▄▅▆▇█"
-    line = Text()
-    trend = "green" if points[-1] <= points[0] else "yellow"
-    for value in points:
-        index = int((value - low) / span * (len(blocks) - 1))
-        line.append(blocks[max(0, min(len(blocks) - 1, index))], style=trend)
-    return line
-
 def _area_chart(values, width, rows=6):
     """A compact filled loss chart that uses vertical terminal space."""
     if not values:
@@ -2642,12 +2628,13 @@ class HeadlessRunControl:
         self.pause_event = threading.Event()
         self.halt_event = threading.Event()
 
-    def request_quit(self):
+    def request_quit(self, announce=True):
         if self.quit_event.is_set():
             return
         self.quit_event.set()
         self.halt_event.set()
-        log.info("Stopping at the next safe step…")
+        if announce:  # never log from a signal handler; logging can deadlock
+            log.info("Stopping at the next safe step…")
 
     def toggle(self):
         if self.quit_event.is_set():
@@ -2741,7 +2728,8 @@ class TerminalDashboard:
                 if loss is not None and loss > 0:
                     self.loss = loss
                     self._losses.append(loss)
-                    self.best_loss = min(self._losses)
+                    if self.best_loss is None or loss < self.best_loss:
+                        self.best_loss = loss
                 if tps is not None:
                     self.tps = tps
                 if time_left is not None:
@@ -2941,7 +2929,8 @@ class TerminalDashboard:
             graph = self._graph_panel(snap, panel_width, rows=graph_rows)
             predictions = self._predictions_panel(snap, wide, column_width)
             activity = self._activity_panel(snap, wide, column_width)
-            action = "start" if snap["paused"] else "stop"
+            idle = snap["status"] in ("idle", "stopped", "error")
+            action = "start" if snap["paused"] or idle else "stop"
             footer = Text(f"[s] {action} training   [q] quit   ·   Ctrl+C quit   ·   --no-tui for plain logs", style="dim")
 
             layout = Layout()
@@ -3053,7 +3042,15 @@ class TerminalDashboard:
             screen=True,
             transient=False,
         )
-        self._live.start(refresh=True)
+        try:
+            self._live.start(refresh=True)
+        except Exception:
+            try:
+                self._live.stop()  # restore the alternate screen if start failed midway
+            except Exception:
+                pass
+            self._live = None
+            raise
 
     def stop(self):
         self.unbind_controls()
@@ -3091,6 +3088,20 @@ def _tui_enabled(args):
     except Exception:
         return False
 
+_HEADLESS_EXIT_MESSAGES = {
+    2: "Authentication failed or no saved session. Run --register or pass --user/--password.",
+    3: "Backend setup failed.",
+    5: "Could not fetch task metadata from the coordinator.",
+    6: "The coordinator rejected this client's architecture.",
+}
+
+# The desktop UI predates these codes; keep its generic registration message.
+_GUI_REGISTER_CODES = {
+    "account_conflict": "register_failed",
+    "rate_limited": "register_failed",
+    "server_error": "register_failed",
+}
+
 _REGISTER_ERRORS = {
     "network": "cannot reach the coordinator",
     "username_taken": "that username is already taken",
@@ -3120,15 +3131,23 @@ def run_register(args):
         if not sys.stdin.isatty():
             log.error("Registration needs --password or CROWDGPT_PASSWORD when stdin is not a terminal.")
             return 2
-        password = getpass.getpass("Password: ")
-        confirm = getpass.getpass("Confirm password: ")
+        try:
+            password = getpass.getpass("Password: ")
+            confirm = getpass.getpass("Confirm password: ")
+        except (EOFError, KeyboardInterrupt):
+            log.error("Registration cancelled.")
+            return 130
         if password != confirm:
             log.error("Passwords do not match.")
             return 2
     if len(password) < 6:
         log.error("Password must be at least 6 characters.")
         return 2
-    token, err = do_register(args.server, username, email, password)
+    try:
+        token, err = do_register(args.server, username, email, password)
+    except KeyboardInterrupt:
+        log.error("Registration cancelled.")
+        return 130
     if not token:
         log.error(f"Registration failed: {_REGISTER_ERRORS.get(err, err or 'unknown error')}.")
         return 1
@@ -3216,14 +3235,18 @@ def run_headless(args):
     root.handlers = [_DashboardLogHandler(dashboard)]
     root.setLevel(logging.DEBUG if args.debug else logging.INFO)
     control = HeadlessRunControl(dashboard)
+    rc = 1
     try:
         if not dashboard.bind_controls(control.toggle, control.request_quit):
             log.info("Keyboard controls unavailable; use Ctrl+C to quit.")
-        return _run_headless(args, dashboard.emit, dashboard, control)
+        rc = _run_headless(args, dashboard.emit, dashboard, control)
+        return rc
     finally:
         root.handlers = old_handlers
         root.setLevel(old_level)
         dashboard.stop()
+        if rc:
+            log.error(_HEADLESS_EXIT_MESSAGES.get(rc, f"Headless run failed (exit {rc})."))
 
 def _run_headless(args, emit, dashboard=None, control=None):
     control = control or HeadlessRunControl(dashboard)
@@ -3258,7 +3281,7 @@ def _run_headless(args, emit, dashboard=None, control=None):
 
     if not args.no_tokenizer: _load_tokenizer_worker()
     stop_event = control.halt_event
-    def _on_signal(signum, frame): control.request_quit()
+    def _on_signal(signum, frame): control.request_quit(announce=False)
     for sig_name in ("SIGINT", "SIGTERM"):
         s = getattr(signal, sig_name, None)
         if s is not None:
