@@ -107,6 +107,10 @@ While the dashboard is running:
 - `q` or `Ctrl+C` quits.
 - The layout reflows when the terminal is resized and works inside `tmux` or `screen`
   (both keys are ordinary characters, not multiplexer prefixes).
+- The dashboard needs a normal UTF-8 terminal. It falls back to plain logs on
+  `TERM=dumb`/`unknown` and on legacy Windows consoles without VT support; use
+  `--tui` to force it anyway. Modern Windows Terminal is the recommended Windows
+  host.
 
 Create an account without opening the desktop app:
 
