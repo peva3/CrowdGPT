@@ -109,8 +109,8 @@ While the dashboard is running:
   (both keys are ordinary characters, not multiplexer prefixes).
 - The dashboard needs a normal UTF-8 terminal. It falls back to plain logs on
   `TERM=dumb`/`unknown` and on legacy Windows consoles without VT support; use
-  `--tui` to force it anyway. Modern Windows Terminal is the recommended Windows
-  host.
+  `--tui` to override the auto-fallback. Modern Windows Terminal is the
+  recommended Windows host.
 
 Create an account without opening the desktop app:
 
