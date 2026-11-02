@@ -96,11 +96,36 @@ crowdgpt --headless --anon               # train without an account
 crowdgpt --headless --rounds 5           # stop after 5 rounds
 ```
 
+The headless client opens a full-screen terminal dashboard on a TTY. It shows the same
+training metrics as the desktop app: round, step progress, loss graph, tokens/sec, ETA,
+download/upload state, recent model predictions, and an activity log. Use `--no-tui`
+for plain log lines, or `--tui` to force the dashboard.
+
+While the dashboard is running:
+
+- `s` stops training at the next safe step; press `s` again to start a new round.
+- `q` or `Ctrl+C` quits.
+- The layout reflows when the terminal is resized and works inside `tmux` or `screen`
+  (both keys are ordinary characters, not multiplexer prefixes).
+
+Create an account without opening the desktop app:
+
+```bash
+crowdgpt --register --user NAME --email you@example.com
+# prompts for the password without echoing it
+
+crowdgpt --register --user NAME --email you@example.com --password '...'
+```
+
+Registration saves the session token in `checkpoints/auth_token.json`, so the next
+`crowdgpt --headless` run can reuse it. Registration exits without training.
+
 `crowdgpt --help` lists all options. A few settings can also be set through environment variables:
 
 | Variable | Description |
 |---|---|
 | `CROWDGPT_TOKEN` / `CROWDGPT_PASSWORD` | Credentials for headless runs |
+| `CROWDGPT_EMAIL` | Email for `--register` |
 | `CROWDGPT_VRAM_GB` | Same as `--vram-gb` |
 | `CROWDGPT_ENGRAM=0` | Don't train the engram table (same as `--no-engram`) |
 
