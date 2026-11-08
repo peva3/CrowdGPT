@@ -1673,12 +1673,22 @@ class EngramMemory(nn.Module):
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 
-def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+def _streamed_block_params(block, dev, dtype):
     if dtype is not None:
-        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+        return {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+    return {n: p.to(dev) for n, p in block.named_parameters()}
+
+def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+    params = _streamed_block_params(block, dev, dtype)
+    if dtype is not None:
         with torch.autocast(device_type=dev.type, dtype=dtype):
             return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
-    params = {n: p.to(dev) for n, p in block.named_parameters()}
+    return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
+
+def _streamed_block_cached(block, params, dev, dtype, x, cos, sin, use_chunked):
+    if dtype is not None:
+        with torch.autocast(device_type=dev.type, dtype=dtype):
+            return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
     return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
 
 class SotaGPT(nn.Module):
@@ -1704,6 +1714,16 @@ class SotaGPT(nn.Module):
         self.use_ckpt = True
         if not is_cpu and self.gpu_layers == N_LAYERS and self.head_on_gpu:
             self.use_ckpt = not _can_disable_checkpoint(bs, sl, _u8, memory_config["ram_gb"])
+        # Caching streamed parameter copies removes the duplicate H2D copy that
+        # checkpoint recompute would otherwise repeat. It costs ~849 MB on the
+        # default model, so only do it when the budget leaves real headroom.
+        self.cache_streamed_params = False
+        if not is_cpu and self.gpu_layers < N_LAYERS:
+            try:
+                spare = memory_config["ram_gb"] * 1024 ** 3 - estimate_vram_bytes(bs, sl, _u8)
+                self.cache_streamed_params = spare > 2.5 * 1024 ** 3
+            except Exception:
+                self.cache_streamed_params = False
         self.wte = nn.Embedding(VOCAB_SIZE, DIM); self.engram = EngramMemory(bn, device)
         self.blocks = nn.ModuleList([Block() for _ in range(N_LAYERS)])
         self.ln_f = nn.LayerNorm(DIM); self.lm_head = nn.Linear(DIM, VOCAB_SIZE, bias=False)
@@ -1759,7 +1779,11 @@ class SotaGPT(nn.Module):
                 if use_ckpt: x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
                 else: x = block(x, cos, sin, use_chunked)
             else:
-                x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                if getattr(self, 'cache_streamed_params', False):
+                    params = _streamed_block_params(block, dev, stream_dtype)
+                    x = checkpoint(_streamed_block_cached, block, params, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                else:
+                    x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True): return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
