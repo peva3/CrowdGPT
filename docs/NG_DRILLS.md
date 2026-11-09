@@ -58,6 +58,7 @@ Configuration: 3 nodes, quorum 2, lease TTL 3 s. Observed on 2026-11-09:
 | Duplicate finalize to two nodes | first `created=true`, second `false`, third `false`; each node count = 1 |
 | Restart under write load | 40 submissions written; 41 before restart, 41 after, 41 after replay; no loss, no duplicates |
 | 2–2 partition, 4 nodes, global quorum 3 | neither side acquired a lease (`neither_certified=true`) |
+| 2-of-3 witness certificates across processes | 2 certificates accepted; 1 certificate rejected with `quorum not met: 1/2` |
 
 The takeover RTO is dominated by the configured lease TTL, not by election
 work, so it is a lower-bound shape check rather than a tuned number. Node death

@@ -794,3 +794,14 @@ def test_proposal_surface_requires_verified_weight_to_vote(tmp_path, monkeypatch
     denied = client.post(f"/api/proposals/{pid}/vote", headers=_headers("10.0.0.1"))
     assert denied.status_code == 403
     assert denied.json()["detail"]["reason"] == "verified_contributor_required"
+
+
+def test_admin_secret_accepts_header_without_query_string(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    r = client.post("/api/admin/force_round_end",
+                    headers={**_headers("10.0.0.1"), "X-Admin-Secret": "test-secret"},
+                    params={"minutes": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "scheduled"
