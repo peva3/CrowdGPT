@@ -148,10 +148,14 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.6 Baseline report — OPS
 
-- [ ] `docs/NG_BASELINE.md`: p50/p95 unit wall clock, bytes down/up, tokens
+- [x] `docs/NG_BASELINE.md`: p50/p95 unit wall clock, bytes down/up, tokens
   per unit, reported vs held-out loss with the metric's provenance.
-- [ ] State what is **unknown** (per-client timing is not published today).
-- **Evidence:** report committed; numbers traceable to `data/rounds.jsonl`
+- [x] State what is **unknown** (per-client timing is not published today).
+- **Evidence:** `docs/NG_BASELINE.md` (round cadence p50 4.10 h / p95 5.51 h;
+  340.4M p50 tokens per round; 3.94M p50 tokens per delta; 2.63–3.40 GB per
+  unit; reported loss p50 3.1168 nats, no held-out metric). Per-client wall
+  clock is explicitly unknown until timing samples exist. Numbers traceable
+  to `data/rounds.jsonl`. Commit `1a9daee`.
 
 ## P1 — Stateless single orchestrator
 
