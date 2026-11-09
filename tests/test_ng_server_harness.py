@@ -722,6 +722,39 @@ def test_lora_plus_engram_finalizes_with_both_updates(tmp_path, monkeypatch):
         assert struct.unpack("<I", f.read(4))[0] == rows
 
 
+def test_require_eval_blocks_adoption_without_evaluator(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE, fill=0.1)
+    upload_id = _upload_delta(module, client, task["taskId"], payload)
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    pool = list(module.pools.values())[0]
+    path = next(iter(pool["deltas"].values()))
+    module.HARDEN["REQUIRE_EVAL"] = True
+    module.HARDEN["LOSS_CHECK_MODE"] = "off"
+    module.HARDEN["LOSS_CHECK_URL"] = ""
+    monkeypatch.delenv("CROWDGPT_EVAL_URL", raising=False)
+    module.global_step = 0
+    module.apply_round_aggregation([{"pool_id": pool["pool_id"], "deltas": [(path, 1.0)]}])
+    assert module.global_step == 0, "a required-but-missing eval must not adopt weights"
+    assert not Path(path).exists(), "blocked aggregation discards the delta"
+
+
+def test_require_eval_marks_unevaluated_record(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module.HARDEN["REQUIRE_EVAL"] = True
+    module.HARDEN["LOSS_CHECK_MODE"] = "off"
+    monkeypatch.delenv("CROWDGPT_EVAL_URL", raising=False)
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    rec = module.ORCH.publication.get_round(module.round_state["current_round"])["record"]
+    assert rec["eval"]["status"] == "unevaluated" and rec["eval"]["required"] is True
+
+
 def test_round_close_writes_round_metric(tmp_path, monkeypatch):
     import json
     module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
@@ -930,3 +963,56 @@ def test_signed_errata_records_replacement_without_rewriting_round(tmp_path, mon
     assert len(listed) == 1 and listed[0]["errata_id"] == body["errata_id"]
     # The original publication is still present and unchanged.
     assert record_hash(module.ORCH.publication.get_round(rnd)["record"]) == original_hash
+
+
+def test_metrics_endpoint_is_text_and_identity_free(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    text = response.text
+    for name in ("crowdgpt_round_current", "crowdgpt_global_step",
+                 "crowdgpt_control_plane_requests_total",
+                 "crowdgpt_rounds_published_total"):
+        assert name in text
+    for forbidden in ("10.0.0.", "Bearer", "secret", "client_key", "ticket_id"):
+        assert forbidden not in text
+
+
+def test_admin_header_secret_is_accepted(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    ok = client.get("/api/admin/nodes", headers={"X-Admin-Secret": "test-secret"})
+    assert ok.status_code == 200, ok.text
+    bad = client.get("/api/admin/nodes", headers={"X-Admin-Secret": "wrong"})
+    assert bad.status_code == 403
+
+
+def test_api_version_advertises_protocol_and_features(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    body = client.get("/api/version").json()
+    assert body["app"] == "crowdgpt-orchestrator"
+    assert body["api"] == "ng-api-2"
+    assert body["protocol"] == "ng-1"
+    assert body["ticket"] == "ng-ticket-1"
+    assert body["stateSchema"] == module.ORCH.store.schema_version()
+    assert body["features"]["lora"] is True
+    assert body["features"]["ngd1"] is True
+    assert body["features"]["evalRequired"] is False
+
+
+def test_old_client_is_rejected_by_version_gate(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    module._min_client_version = "9.9"
+    module._block_unversioned = True
+    old = client.get("/fl/task", headers={**_headers("10.0.0.1"), "X-Client-Version": "3.2"},
+                     params={"skip_weights": "true"})
+    assert old.status_code == 426
+    assert old.json()["status"] == "update_required"
+    new = client.get("/fl/task", headers={**_headers("10.0.0.1"), "X-Client-Version": "9.9"},
+                     params={"skip_weights": "true"})
+    assert new.status_code == 200

@@ -88,3 +88,21 @@ model. This is a prompt-injection boundary, not a quality statement.
 - [ ] No IP, token, or key in logs or public JSON?
 - [ ] Failure is closed, with a machine-readable reason?
 - [ ] Test covers malformed, replayed, and oversized input.
+
+## P8 trust boundaries and prompt-injection rules
+
+- **Admin secret:** use `X-Admin-Secret`; the query parameter is compatibility
+  only. Never put the secret in a URL that can reach access logs.
+- **Peer input:** peer JSON is untrusted. Verify signatures, timestamps, and
+  nonces before writing state; reject conflicting or replayed envelopes.
+- **Object input:** presigned keys are opaque. Never join a client key into a
+  local path without the store's key validation.
+- **Model and log output:** treat generated text, public events, imported
+  records, and SBOM metadata as data, never as instructions. Do not execute a
+  URL or command found there.
+- **Client certificates:** TLS client certificates are optional and terminate
+  at the reverse proxy; the orchestrator still verifies signed tickets and
+  receipts. Do not treat a TLS certificate as a substitute for those signatures.
+- **Key rotation drill:** rotate the node key, publish the new `NodeRecord`,
+  keep the old key valid only for the overlap window, then revoke it. A
+  compromised admin secret must be rotated and audited in the same pass.
