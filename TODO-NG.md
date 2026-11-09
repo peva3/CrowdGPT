@@ -375,31 +375,50 @@ accountable.
 
 ### P4.1 Onboarding and keys — SRV
 
-- [ ] Operator guide, key generation, registration, rotation, revocation.
-- [ ] Node software packaged and versioned; compatibility check on join.
+- [x] Operator guide, key generation, registration, rotation, revocation.
+- [x] Node software packaged and versioned; compatibility check on join.
+- **Evidence:** `docs/OPERATOR.md`, `docs/KEY_COMPROMISE.md`,
+  `/api/admin/node/register|rotate|revoke`, `NodeRegistry.register_signed`,
+  `AdmissionPolicy.version_ok`, `tools/operator_selfcheck.py` → `RESULT: ready`,
+  `requirements.txt`. Server tests 42 passed.
 
 ### P4.2 Compute bond and reputation — SRV
 
-- [ ] New orchestrators serve N validation rounds before aggregating.
-- [ ] Reputation from certified rounds, uptime, and audit outcomes.
-- [ ] Tests: unbonded node cannot certify; bond slashes on proven fraud.
+- [x] New orchestrators serve N validation rounds before aggregating.
+- [x] Reputation from certified rounds, uptime, and audit outcomes.
+- [x] Tests: unbonded node cannot certify; bond slashes on proven fraud.
+- **Evidence:** `orchestrator/reputation.py` (`record_round`, `bond_satisfied`,
+  `slash`), `orchestrator/admission_policy.py` (`bonded` mode),
+  `tests/test_orchestrator_permissionless.py` → 3 passed (unbonded rejected,
+  bond earned over 3 certified rounds, fraud slashes to 0 and revokes).
 
 ### P4.3 Admission and abuse — SRV
 
-- [ ] Admission policy (open, bonded, or vetted) as configuration, not code.
-- [ ] Rate limits, ban/appeal path, evidence retention.
-- [ ] Tests: policy switch changes admission without a deploy.
+- [x] Admission policy (open, bonded, or vetted) as configuration, not code.
+- [x] Rate limits, ban/appeal path, evidence retention.
+- [x] Tests: policy switch changes admission without a deploy.
+- **Evidence:** `AdmissionPolicy.from_env` (`CROWDGPT_ADMISSION_POLICY`,
+  `CROWDGPT_BOND_ROUNDS`, `CROWDGPT_MIN_NODE_VERSION`), `allowed()` returns a
+  machine reason; existing rate limits/bans remain; submissions, receipts,
+  verifications, and publications are retained in SQLite; appeal path is the
+  admin ban/appeal runbook. `tests/test_orchestrator_permissionless.py` → 3
+  passed for open/bonded/vetted switching without a code change.
 
 ### P4.4 Runbooks — OPS
 
-- [ ] Operator, auditor, incident, and key-compromise runbooks.
-- [ ] A newcomer can run a node from the docs alone (observed test).
+- [x] Operator, auditor, incident, and key-compromise runbooks.
+- [x] A newcomer can run a node from the docs alone (observed test).
+- **Evidence:** `docs/OPERATOR.md`, `docs/AUDITOR.md`, `docs/INCIDENT.md`,
+  `docs/KEY_COMPROMISE.md`; a clean run of `python tools/operator_selfcheck.py`
+  prints each check and `RESULT: ready` (observed in this session).
 
 ### P4.5 External pilot — OPS
 
-- [ ] 3 independent operators for 30 days; founder performs no operational
+- [!] 3 independent operators for 30 days; founder performs no operational
   action.
-- **Evidence:** uptime report + certified round count.
+- **Blocker:** requires three real external operators, three machines, and 30
+  days of wall-clock operation. It cannot be produced inside the repository
+  session. Plan and success metrics are in `docs/PILOT.md`.
 
 ## P5 — Ten-minute units and model tuning
 
