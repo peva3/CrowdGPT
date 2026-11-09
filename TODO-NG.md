@@ -63,6 +63,24 @@ P0–P4 ≈ 12–17 person-weeks (two engineers ≈ 10–12 calendar weeks). P5 
 parallel from P1. **P3 must follow P2**: quorum without signed records only
 multiplies unverifiable claims.
 
+### Gate status at 2026-11-09
+
+Code and unit-level evidence are complete for P0–P5 and X1–X5. Operational
+gates that need real machines, real operators, or wall-clock time are **not**
+claimed:
+
+| Gate | Status |
+|---|---|
+| P0: 10 recorded/evaluated/published rounds | code and exporter done; a live 10-round run is pending |
+| P1: kill -9 restart, no lost work | restart drills pass; a live multi-round run is pending |
+| P2: fake detected, 30 rounds with ≥2 attestations | adversarial tests pass; 30 live attested rounds pending |
+| P3: leader kill ×3, RTO < 1 round, failover < 60 s | logical drills pass; real 3-node RTO **unknown** |
+| P4: 3 external operators × 30 days | **blocked** (P4.5); needs real people and wall clock |
+| P5: p50 unit < 10 min on 12 GB; −0.1 nat in 4 weeks | memory fit measured (3.79 GB at seq 2048); 4-week loss run pending |
+
+The repository cannot manufacture the pending rows. They are the pilot work in
+`docs/PILOT.md`, not code tasks.
+
 ## P0 — Contracts and honest baseline
 
 Goal: freeze the wire objects, make every historical round exportable, and
