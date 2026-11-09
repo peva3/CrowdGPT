@@ -153,3 +153,48 @@ def test_dataset_batches_do_not_repeat_samples(client_module):
     ds2.cohort_mode = False; ds2.advance = lambda *a, **k: True
     seen2 = [int(ds2.get_batch(1, seed=2)[0][0][0]) for _ in range(16)]
     assert len(set(seen2)) == 16
+
+
+def test_get_failover_moves_to_next_url(client_module, monkeypatch):
+    calls = []
+
+    class Reply:
+        status_code = 200
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.startswith("https://a.example"):
+            raise OSError("connection refused")
+        return Reply()
+
+    monkeypatch.setenv("CROWDGPT_ORCHESTRATORS", "https://b.example")
+    monkeypatch.setattr(client_module.requests, "get", fake_get)
+    reply = client_module._get_with_failover("https://a.example", "/fl/round_status",
+                                             retries=2)
+    assert reply.status_code == 200
+    assert calls == ["https://a.example/fl/round_status",
+                     "https://b.example/fl/round_status"]
+
+
+def test_wait_for_round_uses_failover(client_module, monkeypatch):
+    calls = []
+
+    class Reply:
+        status_code = 200
+
+        def json(self):
+            return {"current_round": 9, "in_cooldown": False, "is_aggregating": False}
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if url.startswith("https://a.example"):
+            raise OSError("connection refused")
+        return Reply()
+
+    monkeypatch.setenv("CROWDGPT_ORCHESTRATORS", "https://b.example")
+    monkeypatch.setattr(client_module.requests, "get", fake_get)
+    stop = __import__("threading").Event()
+    status = client_module.wait_for_round("https://a.example", {}, stop,
+                                          lambda *a, **k: None)
+    assert status["current_round"] == 9
+    assert any(url.startswith("https://b.example") for url in calls)

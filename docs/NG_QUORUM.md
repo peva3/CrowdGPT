@@ -34,7 +34,11 @@ nothing; a forged witness signature is ignored.
 
 `CROWDGPT_ORCHESTRATORS` env var: `https://a,https://b,https://c`.
 `_post_json_with_retry` rewrites the base URL on a failed attempt and retries
-the same idempotent request. Tests assert the A→B→C→A rotation.
+the same idempotent request. `_get_with_failover` does the same for
+`/fl/round_status`, `/fl/task` (metadata and streamed), and `/fl/heartbeat`; it
+rotates only on connection errors, so an HTTP refusal keeps its existing
+handling. Tests assert the A→B→C→A rotation for POST and that a client waiting
+on a dead node reaches the next one.
 
 ## Evidence
 
