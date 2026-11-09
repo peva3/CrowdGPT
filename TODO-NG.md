@@ -105,15 +105,17 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.3 Held-out eval harness v0 — NG
 
-- [ ] `crowdgpt_ng/eval.py`: hash-pinned token shards, fixed window stride,
+- [x] `crowdgpt_ng/eval.py`: hash-pinned token shards, fixed window stride,
   mean negative log-likelihood in nats, bootstrap confidence interval.
-- [ ] Manifest records dataset hash, token count, model weights hash, code
+- [x] Manifest records dataset hash, token count, model weights hash, code
   commit, and tokenizer revision; refuse to run if a hash does not match.
-- [ ] CPU-feasible sampling mode (N windows, seeded) for the 2-core
+- [x] CPU-feasible sampling mode (N windows, seeded) for the 2-core
   coordinator.
-- [ ] Tests: known logits produce the expected loss; manifest mismatch
+- [x] Tests: known logits produce the expected loss; manifest mismatch
   refuses; sampling is deterministic.
-- **Evidence:** `pytest tests/test_ng_eval.py -q`
+- **Evidence:** `tests/test_ng_eval.py` — 14 passed; full workspace suite —
+  242 passed, 3 skipped. Uniform-logits test yields exactly `ln(5)`.
+  Commit `5be9986`.
 
 ### P0.4 Server test harness and baseline — SRV
 
