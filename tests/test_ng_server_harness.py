@@ -4,7 +4,8 @@ The public server repository does not ship `krum_stream` or `slowapi`, so this
 module imports `server.py` against small local stand-ins and a temporary data
 directory. The tests pin the wire behaviour we must preserve while the
 orchestrator is made replaceable (P0.4 / P1): a pooled task, a chunked delta
-upload, the admin round-end seam, and the in-memory state a restart drops.
+upload, the admin round-end seam, and reconstruction of pools, tasks, and live
+tickets after a restart.
 
 Run with:
     CROWDGPT_SERVER_DIR=/path/to/CrowdGPT-Server pytest tests/test_ng_server_harness.py -q
@@ -57,6 +58,9 @@ def _prepare_repo(tmp_path: Path) -> Path:
     repo.mkdir()
     shutil.copy2(SERVER_DIR / "server.py", repo / "server.py")
     shutil.copy2(SERVER_DIR / "public_log.py", repo / "public_log.py")
+    orchestrator = SERVER_DIR / "orchestrator"
+    if orchestrator.is_dir():
+        shutil.copytree(orchestrator, repo / "orchestrator")
     return repo
 
 
@@ -224,7 +228,7 @@ def test_pooled_round_flow_and_request_count(tmp_path, monkeypatch):
     assert len(requests) == 8, requests
 
 
-def test_restart_drops_in_memory_round_state(tmp_path, monkeypatch):
+def test_restart_reconstructs_round_pools_and_tickets(tmp_path, monkeypatch):
     repo = _prepare_repo(tmp_path)
     first = _configure(_import_server(repo, monkeypatch), monkeypatch)
     client = TestClient(first.app)
@@ -242,13 +246,16 @@ def test_restart_drops_in_memory_round_state(tmp_path, monkeypatch):
 
     # Simulated process restart: same files on disk, a fresh module namespace.
     second = _configure(_import_server(repo, monkeypatch), monkeypatch)
+    assert second.ORCH is not None, "orchestrator package should be copied by the harness"
+    assert second._restore_orchestrator_state() is True
+
     second_client = TestClient(second.app)
     status = second_client.get("/fl/round_status", headers=_headers("10.0.0.3"))
     assert status.status_code == 200
 
-    assert second.task_tickets == {}
-    assert second.db["tasks"] == {}
-    assert second.pools == {}
-    assert second.client_pool_map == {}
-    assert second.ready_pools == []
-    assert second.round_state["force_end_at"] is None
+    assert second.task_tickets, "live tickets should survive a restart"
+    assert second.db["tasks"], "tasks should be rebuilt from persisted pools"
+    assert len(second.pools) == 1
+    assert second.round_state["current_round"] == first.round_state["current_round"]
+    assert len(next(iter(second.pools.values()))["clients"]) == 2
+    assert second.client_pool_map, "pool membership should be reconstructed"

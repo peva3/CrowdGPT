@@ -164,12 +164,22 @@ duplicating work, and that never proxies bulk bytes.
 
 ### P1.1 Server structure — SRV
 
-- [ ] Split admission/scheduling, submission/aggregation, verification, and
+- [x] Split admission/scheduling, submission/aggregation, verification, and
   publication into modules with explicit interfaces.
-- [ ] Replace in-memory rounds/pools/tickets with SQLite WAL (Postgres later
+- [x] Replace in-memory rounds/pools/tickets with SQLite WAL (Postgres later
   only if measured necessary).
-- [ ] Persist tickets, round state, and pool membership; reconstruct on boot.
-- [ ] Tests: every module can be imported and exercised without the HTTP layer.
+- [x] Persist tickets, round state, and pool membership; reconstruct on boot.
+- [x] Tests: every module can be imported and exercised without the HTTP layer.
+- **Evidence:** `CrowdGPT-Server/orchestrator/` (state, admission, scheduling,
+  submission, verification, publication, service); schema v1 with `rounds`,
+  `pools`, `pool_members`, `tickets`, `uploads`, `submissions`,
+  `verifications`, `publications`, `events`. `pytest tests -q` in the server
+  checkout → 7 passed, including a subprocess assertion that importing the
+  package does not import FastAPI. `Crowdgpt-ng/tests/test_ng_server_harness.py`
+  → 2 passed; the restart case now asserts pools, tasks, membership, and live
+  tickets are reconstructed. Server commits `49a28ce`, `db6c38e`, `605ebc0`
+  (local; no writable server fork). Design and integration points in
+  `CrowdGPT-Server/docs/ORCHESTRATOR_MODULES.md`.
 
 ### P1.2 Durable tickets and idempotent submission — SRV
 
