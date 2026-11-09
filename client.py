@@ -3016,7 +3016,9 @@ def _ngd1_compress(values):
     padded = np.zeros(nb * 1024, dtype=np.float32)
     padded[:n] = arr
     matrix = padded.reshape(nb, 1024)
-    scales = np.mean(np.abs(matrix), axis=1).astype(np.float16)
+    counts = np.full(nb, 1024, dtype=np.float64)
+    counts[-1] = n - (nb - 1) * 1024
+    scales = (np.abs(matrix).sum(axis=1) / counts).astype(np.float16)
     bits = (matrix >= 0).astype(np.uint8)
     packed = np.packbits(bits.reshape(-1), bitorder="little").tobytes()
     raw = b"NGD1" + struct.pack("<QI", n, 1024) + scales.tobytes() + packed
