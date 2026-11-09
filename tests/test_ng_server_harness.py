@@ -743,6 +743,25 @@ def test_require_eval_blocks_adoption_without_evaluator(tmp_path, monkeypatch):
     assert not Path(path).exists(), "blocked aggregation discards the delta"
 
 
+def test_require_eval_allows_adoption_when_evaluator_configured(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE, fill=0.1)
+    upload_id = _upload_delta(module, client, task["taskId"], payload)
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    pool = list(module.pools.values())[0]
+    path = next(iter(pool["deltas"].values()))
+    module.HARDEN["REQUIRE_EVAL"] = True
+    module.HARDEN["LOSS_CHECK_MODE"] = "off"
+    monkeypatch.setenv("CROWDGPT_EVAL_URL", "http://127.0.0.1:9")
+    module.global_step = 0
+    module.apply_round_aggregation([{"pool_id": pool["pool_id"], "deltas": [(path, 1.0)]}])
+    assert module.global_step == 1, "a configured evaluator permits adoption"
+
+
 def test_require_eval_marks_unevaluated_record(tmp_path, monkeypatch):
     module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
     client = TestClient(module.app)
