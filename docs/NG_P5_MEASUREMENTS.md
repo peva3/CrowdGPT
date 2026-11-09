@@ -98,3 +98,27 @@ Synthetic 4,000,000-param fixture (IEEE float32, sigma 0.01):
 The projection is arithmetic, not a captured production delta; a real delta
 fixture is still unmeasured. Reconstruction is intentionally coarse (one sign
 plus a block scale), so this is a bandwidth mechanism, not a lossless path.
+
+## NGD1 codec on a local model delta
+
+Command:
+
+    .venv/bin/python tools/bench_codec_fixture.py --params 64000000
+
+One full-parameter SGD step on the 658M model (random tokens, seq 128), then
+the first 64M parameters of the update:
+
+| measure | value |
+|---|---|
+| dense bytes | 256,000,000 |
+| compressed bytes | 1,937,282 |
+| ratio | 132.14x |
+| bytes/param | 0.03027 |
+| encode / decode | 0.771 s / 0.710 s |
+| mean abs error | 1.156e-08 |
+| mean abs value | 1.331e-08 |
+
+This is a **local model delta**, not a captured production client delta. The
+small SGD step produces very small values, and the 1-bit sign codec's error is
+the same order as the update magnitude. The ratio is real; the reconstruction
+error is not evidence that the codec preserves a production update.

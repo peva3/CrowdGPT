@@ -906,3 +906,27 @@ def test_peer_routes_accept_signed_ticket_round_and_submission(tmp_path, monkeyp
     assert signed.status_code == 200, signed.text
     assert signed.json()["node"] == (module.NODE_ID or "node-test")
     peer_store.close()
+
+
+def test_signed_errata_records_replacement_without_rewriting_round(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    rnd = module.round_state["current_round"]
+    original = module.ORCH.publication.get_round(rnd)["record"]
+    from orchestrator.records import record_hash
+    original_hash = record_hash(original)
+    replacement = "b" * 64
+    response = client.post(
+        "/api/admin/errata", params={"secret": "test-secret"},
+        json={"round": rnd, "reason": "wrong held-out loss label",
+              "replacementRecordHash": replacement})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["original_record_hash"] == original_hash
+    assert body["replacement_record_hash"] == replacement
+    listed = client.get("/api/audit/errata", params={"round": rnd}).json()["errata"]
+    assert len(listed) == 1 and listed[0]["errata_id"] == body["errata_id"]
+    # The original publication is still present and unchanged.
+    assert record_hash(module.ORCH.publication.get_round(rnd)["record"]) == original_hash
