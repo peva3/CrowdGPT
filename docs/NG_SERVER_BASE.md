@@ -139,8 +139,11 @@ work.
 
 ## Repository state
 
-There is no writable fork of `Vxtzq/CrowdGPT-Server` under the `peva3`
-account (`git ls-remote` returns repository not found). Server changes stay
-local in `/app/crowdgpt/CrowdGPT-Server` until a fork is explicitly approved.
+A writable fork now exists: `https://github.com/peva3/CrowdGPT-Server`
+(`fork` remote in the local checkout). It was created 2026-11-09 from
+`Vxtzq/CrowdGPT-Server` and fast-forwarded to `f8e445e`, which includes all
+P0.4–P5 server work. `origin` still points at the upstream repository, so
+push to `fork` explicitly.
+
 The ng changes live in `/app/crowdgpt/Crowdgpt-ng` and are pushed to
 `origin/ng/main`.

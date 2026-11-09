@@ -540,6 +540,69 @@ per FLOP.
   pseudogradient is 23 bytes. This is a mechanism check, not a production
   model-loss comparison.
 
+## P6 — Ship-readiness hardening
+
+Discovered during the 2026-11-09 review in `docs/NG_SHIP_REVIEW.md`. These are
+not part of the original P0–P5 scope; they are the gaps between "the code
+exists" and "the principle holds on a live network".
+
+### P6.1 LoRA pool isolation — SRV/NG (severity A)
+
+- [ ] Advertise train mode (`dense|lora`) in the client hardware headers and
+  add it as an exact-match element of `_hw_signature`.
+- [ ] Put `trainMode` and `loraRank` in the task payload; reject a submission
+  whose mode does not match its ticket; test a mixed-pool attempt.
+- [ ] Decide and document whether LoRA trains engram rows; today it silently
+  skips them.
+
+### P6.2 Held-out eval on every published round — SRV (severity B)
+
+- [ ] Call the P0.3 evaluator after aggregation; store loss, CI, and manifest
+  hash in the `RoundRecord` instead of `eval=None`.
+- [ ] Emit `nutrition.json` next to the HF weights from the signed record.
+- [ ] Correct the docs until this exists: records are attested, not evaluated.
+
+### P6.3 Leaderboard and contribution ledger from records — SRV (severity B)
+
+- [ ] Rank from verified `submissions` + `receipts` (tokens, accepted rounds,
+  streaks), not self-reported `users.json` totals.
+- [ ] Keep the legacy number as a labelled fallback during migration.
+- [ ] Add a proposal/vote surface for "what improves next" (PM-4).
+
+### P6.4 Uniform client failover — NG (severity B)
+
+- [ ] Route GET, metadata, and streamed weight requests through the same
+  URL-rotating transport as POST; today only POST fails over.
+- [ ] Test: first node dies while waiting for a round; client reaches the
+  second node without duplicating work.
+
+### P6.5 Metrics and protocol conformance — SRV/NG (severity B)
+
+- [ ] Write one `RoundMetric` per round close (or correct the observability
+  doc to say the recorder is unwired).
+- [ ] Add a conformance test that builds the same objects from
+  `crowdgpt_ng/protocol.py` and `orchestrator/records.py` and compares
+  canonical bytes, hashes, and signatures.
+- [ ] Wire the 1-bit delta codec into dense uploads and measure a real delta
+  fixture; it is currently library-only.
+
+### P6.6 Cross-node state replication — SRV (severity C, project)
+
+- [ ] Design and implement lease/registry/ticket replication across
+  orchestrators. The current quorum primitives read local SQLite only, so two
+  nodes can both hold a lease and 2-of-3 certificates cannot be assembled.
+- [ ] Measure a real 3-node RTO and partition drill; keep the P3 gate
+  unclaimed until then.
+
+### P6.7 Public-server completeness — SRV (severity C)
+
+- [ ] Publish a reference `krum_stream` (or pin an explicit dependency) so an
+  external operator can run aggregation from the fork.
+- [ ] Client-side verification of round certificates and inclusion proofs.
+- [ ] Signed errata/supersede record type for a wrong publication.
+- [ ] Admin secret via header; deprecate the query-string form.
+- [ ] Pin `slowapi` or make the limiter optional in the public build.
+
 ## Cross-cutting
 
 - [x] **X1 Wiki**: update `.opencode/wiki/` at each phase gate; link evidence.
