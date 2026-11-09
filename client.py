@@ -1267,6 +1267,33 @@ def _clear_saved_token_if_matches(h):
         try: AUTH_TOKEN_FILE.unlink(missing_ok=True)
         except OSError: pass
 
+_CLIENT_ID_KEY = None
+def _client_identity():
+    """Persistent Ed25519 key for signing step receipts (optional)."""
+    global _CLIENT_ID_KEY
+    if _CLIENT_ID_KEY is not None: return _CLIENT_ID_KEY
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        path = CHECKPOINT_DIR / "client_key.pem"
+        if path.exists():
+            key = serialization.load_pem_private_key(path.read_bytes(), password=None)
+            if not isinstance(key, Ed25519PrivateKey): raise ValueError("not Ed25519")
+        else:
+            key = Ed25519PrivateKey.generate()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(key.private_bytes(serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            try: os.chmod(path, 0o600)
+            except OSError: pass
+        pub = key.public_key().public_bytes(serialization.Encoding.Raw,
+                                            serialization.PublicFormat.Raw).hex()
+        _CLIENT_ID_KEY = (key, pub)
+        return _CLIENT_ID_KEY
+    except Exception:
+        _CLIENT_ID_KEY = (None, None)
+        return _CLIENT_ID_KEY
+
 def _hardware_headers(force_mode=None):
     try: bs = recommend_batch_size(MAX_SEQ_LEN, force_mode=force_mode)
     except Exception: bs = 1
@@ -1309,6 +1336,7 @@ def _hardware_headers(force_mode=None):
         "X-Client-Device":    DEVICE_ID,
         "X-Client-Compute-Cap": _cc,   # NEW
         "X-Client-Version":   CLIENT_VERSION,
+        **({"X-Client-Pubkey": _client_identity()[1]} if _client_identity()[1] else {}),
     }
 
 def _doctor_package_version(name):
@@ -2503,6 +2531,25 @@ def _chunk_ce(xs, w, ys, pos_step=64):
         )
     return total / (B * T)
 
+_FP_MATRIX = None
+def _fp_matrix():
+    global _FP_MATRIX
+    if _FP_MATRIX is None:
+        _FP_MATRIX = np.random.default_rng(0x0C0FFEE).standard_normal((DIM, 64), dtype=np.float32)
+    return _FP_MATRIX
+
+def _fp_from_hidden(xe):
+    arr = xe.detach().float().mean(dim=0).cpu().numpy()
+    m = _fp_matrix(); n = min(32, arr.shape[0])
+    out = bytearray(int(n).to_bytes(2, "little"))
+    for i in range(n):
+        bits = (arr[i] @ m) > 0
+        val = 0
+        for j, b in enumerate(bits):
+            if b: val |= (1 << j)
+        out.extend(val.to_bytes(8, "little"))
+    return bytes(out)
+
 def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
     sd = ad if ua else None; nc = max(1, math.ceil(sl / loss_chunk))
     def compute():
@@ -2591,8 +2638,8 @@ class DegradeLadder:
 def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
     while True:
         try:
-            lo, cards = _fwl(model, x, y, sl, ua, ad, ls, preview=preview, loss_chunk=ladder.loss_chunk)
-            lo.backward(); return lo, cards
+            lo, cards, fp = _fwl(model, x, y, sl, ua, ad, ls, preview=preview, loss_chunk=ladder.loss_chunk)
+            lo.backward(); return lo, cards, fp
         except RuntimeError as e:
             if not _is_oom(e): raise
             emit('log', f"💥 OOM detected: {str(e).splitlines()[0]}"); _clear_accel_cache(model.accel_device)
@@ -2942,6 +2989,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         timing.finish(ok=False, error="no_round")
         return
     cr = rs["current_round"]; timing.set_round(cr)
+    _unit_started_iso = datetime.now(timezone.utc).isoformat()
     timing.phase("queue", time.monotonic() - round_started)
     hb = HeartbeatManager(srv, h, cr, se, emit); hb.start()
     model = ob = oe = x = y = lo = iw = ie = iew = ds = None
@@ -2949,6 +2997,8 @@ def run_single_round_wrapper(srv, at, se, emit):
     cohort_mode = False; cc_seed = cc_steps = cc_bs = cc_accum = cc_autocast = None; cc_optim = "any"
     optim_mode = None
     round_loss_sum = 0.0; round_loss_sq_sum = 0.0; round_loss_count = 0
+    fp_digest = hashlib.sha256(); fp_steps = 0
+    loss_samples = []
     last_step_loss = None
     exc_type = None; exc_text = ""
     try:
@@ -3144,11 +3194,13 @@ def run_single_round_wrapper(srv, at, se, emit):
                 sd = (int(cc_seed) * 100_003 + micro_step * 1009) & 0xFFFFFFFF if cohort_mode else (abs(hash("t")) % 10000) + micro_step * 1000 + mi
                 x, y = ds.get_batch(bs, seed=sd)
                 want_preview = (model.main_device.type != 'cpu') and ((micro_step == 0) or ((micro_step + 1) % PREVIEW_EVERY == 0))
-                try: lo, cards = _train_step_safe(model, x, y, sl, ua, ad, ls, preview=want_preview, ladder=ladder, emit=emit)
+                try: lo, cards, _fp = _train_step_safe(model, x, y, sl, ua, ad, ls, preview=want_preview, ladder=ladder, emit=emit)
                 except CohortAbort: return
+                if _fp: fp_digest.update(_fp); fp_steps += 1
                 lval = float(lo.item()) * as_
                 als += lval; tt += x.numel(); accum_count += 1; micro_step += 1
                 round_loss_sum += lval; round_loss_sq_sum += lval * lval; round_loss_count += 1
+                if len(loss_samples) < 200: loss_samples.append(f"{lval:.6f}")
                 last_step_loss = lval
                 if cards: emit('model_preview', {'step': micro_step, 'cards': cards})
                 elapsed_total = time.time() - cs_
@@ -3206,7 +3258,29 @@ def run_single_round_wrapper(srv, at, se, emit):
             "lastLoss": float(last_step_loss) if last_step_loss is not None else None,
             "lossStd": float(fl_std),
             "lossSamples": int(round_loss_count),
+            "fingerprintRoot": fp_digest.hexdigest() if fp_steps else None,
         }
+        try:
+            _key, _pub = _client_identity()
+            _ticket = (md.get("ticket") or {}) if isinstance(md, dict) else {}
+            if _key and _ticket.get("ticketId"):
+                import secrets as _secrets
+                _base = hashlib.sha256(str(_ticket.get("baseWeights") or "").encode()).hexdigest()
+                _now = datetime.now(timezone.utc).isoformat()
+                _receipt = {"schema": "ng-1", "ticket_id": _ticket["ticketId"],
+                            "round": int(cr), "client_id": DEVICE_ID or "anonymous",
+                            "base_weights": _base, "tokens": int(tt), "steps": int(micro_step),
+                            "loss_samples": list(loss_samples), "loss_mean": f"{fl:.6f}",
+                            "fingerprint_root": fp_digest.hexdigest() if fp_steps else None,
+                            "code_version": CLIENT_VERSION,
+                            "device": {"backend": str(train_backend or ""), "gpu": str(_hardware_headers().get("X-Client-Gpu-Name", ""))},
+                            "started_at": _unit_started_iso, "finished_at": _now,
+                            "nonce": _secrets.token_hex(32)}
+                _body = json.dumps(_receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                submit_extra.update({"receipt": _receipt, "clientPubkey": _pub,
+                                     "receiptSig": _key.sign(_body).hex()})
+        except Exception as _re:
+            log.debug(f"receipt skipped: {_re}")
         pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, "loraRank": 0, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}).encode()
         delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR)); os.close(delta_fd)
         try: delta_size = _write_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, model, iw, (si, sv))

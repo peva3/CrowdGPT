@@ -257,36 +257,59 @@ and excluded.
 
 ### P2.1 Node identity and signed records — SRV/NG
 
-- [ ] Ed25519 node keys; `NodeRecord` published at registration and rotation.
-- [ ] Leader signs `RoundRecord`; witnesses co-sign; certificate embedded.
-- [ ] Client `StepReceipt` signed with the account key (or session key).
-- [ ] Tests: tampered field rejected; unknown key rejected; rotated key obeys
+- [x] Ed25519 node keys; `NodeRecord` published at registration and rotation.
+- [x] Leader signs `RoundRecord`; witnesses co-sign; certificate embedded.
+- [x] Client `StepReceipt` signed with the account key (or session key).
+- [x] Tests: tampered field rejected; unknown key rejected; rotated key obeys
   an overlap window.
+- **Evidence:** `orchestrator/nodes.py` (registration, `rotate(overlap_s)`,
+  `resolve(at)`), `orchestrator/records.py` (`ng-1` canonical records,
+  `sign_record`, `verify_certificate`, multi-witness certificates),
+  `/api/node` + `/api/nodes`, server signs each round close, client key at
+  `checkpoints/client_key.pem` and `X-Client-Pubkey`; `_check_receipt` verifies
+  signature, ticket, round, base hash, and fingerprint. Server tests 32 passed;
+  ng harness 12 passed.
 
 ### P2.2 Activation fingerprints and replay — NG/SRV
 
-- [ ] Fingerprint sampled activations (LSH; ~258 bytes per 32 tokens) into
+- [x] Fingerprint sampled activations (LSH; ~258 bytes per 32 tokens) into
   `StepReceipt.fingerprint_root`.
-- [ ] Validator mode recomputes a random sample of steps and compares
+- [x] Validator mode recomputes a random sample of steps and compares
   fingerprints; flags divergence.
-- [ ] Replay a random fraction of submissions end-to-end; sampling alone is
+- [x] Replay a random fraction of submissions end-to-end; sampling alone is
   not sufficient for a single fake.
-- [ ] Tests: honest client passes; one mutated step flagged; fabricated
+- [x] Tests: honest client passes; one mutated step flagged; fabricated
   fingerprint rejected.
+- **Evidence:** `orchestrator/fingerprints.py` (1536x64 projection, 64-bit
+  SimHash/token, 258-byte 32-token block, SHA-256 root),
+  `orchestrator/validation.py` (`sample_indices`, `replay_fraction`,
+  `compare_sample`), client `_fp_from_hidden` + `CROWDGPT_FINGERPRINT=1`
+  includes the root in the signed receipt. Tests: 4 fingerprint + 3 validation
+  passed (honest passes, one mutated step flagged, fabricated root rejected).
 
 ### P2.3 Merkle log and audit page — SRV
 
-- [ ] Append-only `rounds.jsonl` mirrored to HF and at least one independent
+- [x] Append-only `rounds.jsonl` mirrored to HF and at least one independent
   mirror; Merkle checkpoint every N rounds.
-- [ ] Public audit page: round, leader, witnesses, roots, eval, certificate,
+- [x] Public audit page: round, leader, witnesses, roots, eval, certificate,
   download links.
-- [ ] Tests: inclusion proof verifies; edited record breaks the chain.
+- [x] Tests: inclusion proof verifies; edited record breaks the chain.
+- **Evidence:** `orchestrator/audit.py` (`checkpoint`, `inclusion`,
+  `verify_chain`), `orchestrator/records.py` (`merkle_proof`,
+  `verify_merkle_proof`), `/api/audit/rounds|checkpoint|proof|chain`, `/audit`
+  HTML page, `public_rounds.jsonl` copied to HF as `rounds.jsonl`, and
+  `CROWDGPT_AUDIT_MIRROR`. Tests: inclusion proof valid; edited record no
+  longer matches its leaf. Server 32 passed.
 
 ### P2.4 Adversarial fixtures — NG/SRV
 
-- [ ] Seeded fake-loss client, replayed ticket, duplicated delta, tampered
+- [x] Seeded fake-loss client, replayed ticket, duplicated delta, tampered
   record, and a sybil pair; each must be detected or excluded.
-- **Evidence:** `docs/NG_ADVERSARIAL.md` with test output.
+- **Evidence:** `docs/NG_AUDIT.md`; `CrowdGPT-Server/tests/test_orchestrator_adversarial.py`
+  → 5 passed (implausible loss, sybil origin, replayed ticket, duplicate delta
+  content, tampered record). The HTTP harness rejects a reported loss of
+  `0.001` with `{"reason":"implausible_loss"}`. A consumed ticket is rejected
+  with `ticket_consumed`; duplicate content returns the original submission.
 
 ## P3 — Quorum and failover
 

@@ -126,7 +126,7 @@ def _configure(module, monkeypatch: pytest.MonkeyPatch):
     return module
 
 
-def _delta_body(task_id: str, params: int) -> bytes:
+def _delta_body(task_id: str, params: int, *, loss: float = 2.5) -> bytes:
     metadata = {
         "taskId": task_id,
         "weightFormat": "bf16",
@@ -134,7 +134,7 @@ def _delta_body(task_id: str, params: int) -> bytes:
         "engramSparseCount": 0,
         "localSteps": 1,
         "tokensProcessed": 1234,
-        "loss": 2.5,
+        "loss": loss,
     }
     raw = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
     return struct.pack("<I", len(raw)) + raw + (b"\x00\x00" * params)
@@ -436,3 +436,99 @@ def test_closed_round_is_not_resurrected(tmp_path, monkeypatch):
     assert second._restore_orchestrator_state() is False
     assert second.pools == {}
     assert second.task_tickets == {}
+
+
+def test_signed_round_record_and_node_identity(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    assert module.NODE_ID
+    node = client.get("/api/node")
+    assert node.status_code == 200
+    assert node.json()["nodes"][0]["node_id"] == module.NODE_ID
+
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    rec = module.ORCH.publication.get_round(module.round_state["current_round"])["record"]
+    assert rec["leader"] == module.NODE_ID
+    assert rec["certificate"] and rec["base_weights"] != "0" * 64
+    from orchestrator.records import record_hash, verify_certificate
+    assert verify_certificate(rec, rec["certificate"][0]) is True
+    tampered = dict(rec); tampered["bytes"] = {"down": 0, "up": 0}
+    assert verify_certificate(tampered, rec["certificate"][0]) is False
+    assert record_hash(rec) != record_hash(tampered)
+
+
+def test_signed_client_receipt_is_verified(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from orchestrator.identity import NodeIdentity
+    from orchestrator.records import canonical_json
+
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    ticket = module.ORCH.admission.get("ip:10.0.0.2")
+    key = NodeIdentity.generate()
+    receipt = {
+        "schema": "ng-1", "ticket_id": ticket.ticket_id, "round": ticket.round,
+        "client_id": "device-1",
+        "base_weights": hashlib.sha256(f"step:{module.global_step}".encode()).hexdigest(),
+        "tokens": 1234, "steps": 1, "loss_samples": ["2.500000"],
+        "loss_mean": "2.500000", "fingerprint_root": None,
+        "code_version": "3.2", "device": {"backend": "CUDA", "gpu": "RTX 4090"},
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(timezone.utc).isoformat(), "nonce": "e" * 64,
+    }
+    sig = key.sign(canonical_json(receipt).encode())
+    headers = {**_headers("10.0.0.2"), "X-Client-Pubkey": key.public_key_hex}
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE)
+    init = client.post("/fl/submit/init", headers=headers, json={
+        "taskId": task["taskId"], "totalBytes": len(payload),
+        "chunkSize": len(payload), "chunks": 1,
+        "checksum": hashlib.sha256(payload).hexdigest(),
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 2.5, "localSteps": 1, "tokensProcessed": 1234,
+        "ticketId": ticket.ticket_id, "receipt": receipt,
+        "receiptSig": sig, "clientPubkey": key.public_key_hex,
+    })
+    assert init.status_code == 200, init.text
+    up = init.json()["uploadId"]
+    assert client.post("/fl/submit/chunk", headers={**headers, "Content-Type": "application/octet-stream"},
+                       params={"uploadId": up, "index": 0}, content=payload).status_code == 200
+    final = client.post("/fl/submit/finalize", headers=headers, json={"uploadId": up})
+    assert final.status_code == 200, final.text
+    assert len(module.ORCH.receipts.all(ticket.round)) == 1
+
+
+def test_audit_page_and_proof(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    page = client.get("/audit")
+    assert page.status_code == 200 and "CrowdGPT audit" in page.text
+    rounds = client.get("/api/audit/rounds").json()["rounds"]
+    assert len(rounds) == 1
+    rnd = rounds[0]["record"]["round"]
+    proof = client.get("/api/audit/proof", params={"round": rnd}).json()
+    assert proof["valid"] is True
+    assert client.get("/api/audit/chain").json()["ok"] is True
+
+
+def test_implausible_loss_is_rejected(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE, loss=0.001)
+    checksum = hashlib.sha256(payload).hexdigest()
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.2"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload),
+        "chunkSize": len(payload), "chunks": 1, "checksum": checksum,
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 0.001, "localSteps": 1, "tokensProcessed": 1234,
+    }).json()
+    up = init["uploadId"]
+    client.post("/fl/submit/chunk", headers={**_headers("10.0.0.2"), "Content-Type": "application/octet-stream"},
+                params={"uploadId": up, "index": 0}, content=payload)
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.2"), json={"uploadId": up})
+    assert final.status_code == 400, final.text
+    assert final.json()["detail"]["reason"] == "implausible_loss"
