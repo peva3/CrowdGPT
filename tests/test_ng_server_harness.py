@@ -805,3 +805,41 @@ def test_admin_secret_accepts_header_without_query_string(tmp_path, monkeypatch)
                     params={"minutes": 0})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "scheduled"
+
+
+def test_ngd1_delta_is_decoded_to_dense_bf16(tmp_path, monkeypatch):
+    import numpy as np
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    from orchestrator.compression import pack_frames
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    body = pack_frames([np.full(module.MODEL_SIZE, 0.01, dtype=np.float32)])
+    raw = json.dumps({"taskId": task["taskId"], "weightFormat": "bf16",
+                      "hasEngram": False, "engramSparseCount": 0, "localSteps": 1,
+                      "tokensProcessed": 1234, "loss": 2.5, "deltaCodec": "ngd1"},
+                     separators=(",", ":")).encode()
+    payload = struct.pack("<I", len(raw)) + raw + body
+    checksum = hashlib.sha256(payload).hexdigest()
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.1"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload), "chunkSize": len(payload),
+        "chunks": 1, "checksum": checksum, "weightFormat": "bf16",
+        "hasEngram": False, "engramSparseCount": 0, "loss": 2.5,
+        "localSteps": 1, "tokensProcessed": 1234,
+    })
+    assert init.status_code == 200, init.text
+    up = init.json()["uploadId"]
+    assert client.post("/fl/submit/chunk", headers={
+        **_headers("10.0.0.1"), "Content-Type": "application/octet-stream"},
+        params={"uploadId": up, "index": 0}, content=payload).status_code == 200
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": up})
+    assert final.status_code == 200, final.text
+    stored = Path(next(iter(list(module.pools.values())[0]["deltas"].values())))
+    import torch
+    with open(stored, "rb") as f:
+        n = struct.unpack("<I", f.read(4))[0]
+        meta = json.loads(f.read(n))
+        dense = torch.frombuffer(bytearray(f.read(module.MODEL_SIZE * 2)),
+                                 dtype=torch.uint16).view(torch.bfloat16).float()
+    assert meta["deltaCodec"] == "ngd1"
+    assert float(dense[0]) > 0.0

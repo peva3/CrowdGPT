@@ -74,3 +74,27 @@ compression mechanics at equal work, not production model loss.
 - Multi-GPU / multi-node throughput.
 
 No speedup or quality claim beyond the tables above should be inferred.
+
+## 1-bit delta codec on the wire
+
+`CROWDGPT_DELTA_CODEC=ngd1` writes a framed 1-bit container (`NGD2`): each
+frame is `NGD1` + per-1024 fp16 mean-abs scale + sign bits + zlib. The server
+decodes frames into the dense bf16 stream, so aggregation and cross-check are
+unchanged. LoRA and engram tails keep the existing paths; the codec is used for
+dense, base-only deltas.
+
+Synthetic 4,000,000-param fixture (IEEE float32, sigma 0.01):
+
+| measure | value |
+|---|---|
+| dense bytes | 16,000,000 |
+| compressed bytes | 505,814 |
+| ratio | 31.6x |
+| bytes per param | 0.12645 |
+| projected 657,787,392 params | 83.2 MB |
+| mean abs error | 0.004823 |
+| mean abs value | 0.007975 |
+
+The projection is arithmetic, not a captured production delta; a real delta
+fixture is still unmeasured. Reconstruction is intentionally coarse (one sign
+plus a block scale), so this is a bandwidth mechanism, not a lossless path.

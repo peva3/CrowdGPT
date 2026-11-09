@@ -57,7 +57,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
-import re, sys, io, json, time, struct, math, gc, threading, queue, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse, datetime, uuid, getpass
+import re, sys, io, json, time, struct, math, gc, threading, queue, base64, logging, tempfile, atexit, subprocess, hashlib, shutil, ctypes, signal, argparse, datetime, uuid, getpass, zlib
 import platform
 import importlib.metadata as importlib_metadata
 from pathlib import Path
@@ -605,6 +605,7 @@ try: LORA_RANK = max(1, int(os.environ.get("CROWDGPT_LORA_RANK", "16")))
 except ValueError: LORA_RANK = 16
 try: LORA_ALPHA = float(os.environ.get("CROWDGPT_LORA_ALPHA", "32"))
 except ValueError: LORA_ALPHA = 32.0
+DELTA_CODEC = (os.environ.get("CROWDGPT_DELTA_CODEC", "off") or "off").strip().lower()
 
 LOSS_CHUNK = 256; UPLOAD_BUFFER_MIN = 25; ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 SAFETY_MARGIN_GB = 1.0; ALLOCATOR_RESERVE_GB = 0.5; MIN_HEADROOM_GB = 0.25
@@ -3007,6 +3008,45 @@ def _engram_sparse_delta(table, iew_bf16, frac=None, chunk=32768):
     sv = (table[ai] - iew_bf16[ai].float()).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
     return ai.numpy().astype(np.uint32), sv
 
+def _ngd1_compress(values):
+    """1-bit signs + per-1024 fp16 mean-abs scale + zlib (server-compatible)."""
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    n = int(arr.size)
+    nb = max(1, (n + 1023) // 1024)
+    padded = np.zeros(nb * 1024, dtype=np.float32)
+    padded[:n] = arr
+    matrix = padded.reshape(nb, 1024)
+    scales = np.mean(np.abs(matrix), axis=1).astype(np.float16)
+    bits = (matrix >= 0).astype(np.uint8)
+    packed = np.packbits(bits.reshape(-1), bitorder="little").tobytes()
+    raw = b"NGD1" + struct.pack("<QI", n, 1024) + scales.tobytes() + packed
+    return zlib.compress(raw, 6)
+
+def _write_delta_file_ngd1(path, header_bytes, model, iw_bf16, piece=4_000_000):
+    """Framed 1-bit container. Only used when no engram tail is present."""
+    frames = []
+    total = 0
+    for name, p in model.named_parameters():
+        if name.startswith("engram."): continue
+        flat = p.detach().reshape(-1); size = flat.numel()
+        for i in range(0, size, piece):
+            cur = flat[i:i + piece].to("cpu", torch.float32)
+            delta = (cur - iw_bf16[total:total + cur.numel()].float()).numpy()
+            frames.append(_ngd1_compress(delta))
+            total += int(cur.numel())
+            del cur, delta
+        flat = None
+        p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+    if total != iw_bf16.numel():
+        raise RuntimeError(f"ngd1 delta size mismatch: {total} vs {iw_bf16.numel()}")
+    with open(path, "wb") as f:
+        f.write(header_bytes)
+        f.write(b"NGD2" + struct.pack("<QI", total, len(frames)))
+        for frame in frames:
+            f.write(struct.pack("<I", len(frame)))
+            f.write(frame)
+    return os.path.getsize(path)
+
 def _write_delta_file(path, header_bytes, model, iw_bf16, engram_arrays, level=6, piece=64 * 1024 * 1024):
     with open(path, 'wb') as f, gzip.GzipFile(fileobj=f, mode='wb', compresslevel=level) as gz:
         gz.write(header_bytes); _write_base_delta_bf16(gz, model, iw_bf16)
@@ -3500,7 +3540,8 @@ def run_single_round_wrapper(srv, at, se, emit):
             _trained = ["base"] + (["engram"] if has_engram else [])
             _lora_meta = {"loraRank": 0, "isLoRA": False,
                           "trainMode": "dense", "trainedParams": _trained}
-        pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, ** _lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}).encode()
+        _codec = "ngd1" if (DELTA_CODEC == "ngd1" and not LORA_ACTIVE and not has_engram) else "off"
+        pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, ** _lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, "deltaCodec": _codec, **submit_extra}).encode()
         delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR)); os.close(delta_fd)
         try:
             if LORA_ACTIVE:
@@ -3508,6 +3549,9 @@ def run_single_round_wrapper(srv, at, se, emit):
                 delta_size = _write_lora_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, _lp, (si, sv))
                 emit('log', f"[LORA] adapter payload {delta_size / (1024 * 1024):.1f} MB")
                 _lp = None
+            elif _codec == "ngd1":
+                delta_size = _write_delta_file_ngd1(delta_path, struct.pack('<I', len(pl)) + pl, model, iw)
+                emit('log', f"[CODEC] ngd1 payload {delta_size / (1024 * 1024):.1f} MB")
             else:
                 delta_size = _write_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, model, iw, (si, sv))
         except BaseException:
@@ -3516,7 +3560,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             raise
         finally: iw = None; model = None; del si, sv, pl; _clear_accel_cache(train_device); _trim_heap()
         
-        upload_size_mb = delta_size / (1024 * 1024); meta = {"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, **_lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}
+        upload_size_mb = delta_size / (1024 * 1024); meta = {"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, **_lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, "deltaCodec": _codec, **submit_extra}
         timing_handoff = _submit_delta_background(srv, h, delta_path, delta_size, meta, emit, se, hb=hb, timing=timing)   # discards the delta if refused
         uck.clear()
         threading.Thread(target=prefetch_latest_hf_weights, args=(se, emit), daemon=True).start()
