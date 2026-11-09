@@ -21,6 +21,7 @@ import os
 import shutil
 import struct
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -259,3 +260,105 @@ def test_restart_reconstructs_round_pools_and_tickets(tmp_path, monkeypatch):
     assert second.round_state["current_round"] == first.round_state["current_round"]
     assert len(next(iter(second.pools.values()))["clients"]) == 2
     assert second.client_pool_map, "pool membership should be reconstructed"
+
+
+def _two_client_task(module, client):
+    assert client.get("/fl/task", headers=_headers("10.0.0.1"),
+                      params={"skip_weights": "true"}).json()["status"] == "wait"
+    second = client.get("/fl/task", headers=_headers("10.0.0.2"),
+                        params={"skip_weights": "true"}).json()
+    assert second["taskId"]
+    return second
+
+
+def _upload_delta(module, client, task_id, payload, *, chunk_size=None, order=None):
+    checksum = hashlib.sha256(payload).hexdigest()
+    chunk_size = chunk_size or len(payload)
+    chunks = (len(payload) + chunk_size - 1) // chunk_size
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.1"), json={
+        "taskId": task_id, "totalBytes": len(payload), "chunkSize": chunk_size,
+        "chunks": chunks, "checksum": checksum, "weightFormat": "bf16",
+        "hasEngram": False, "engramSparseCount": 0, "loss": 2.5,
+        "localSteps": 1, "tokensProcessed": 1234,
+    })
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["uploadId"]
+    for index in (order or range(chunks)):
+        part = payload[index * chunk_size:(index + 1) * chunk_size]
+        chunk = client.post("/fl/submit/chunk", headers={
+            **_headers("10.0.0.1"), "Content-Type": "application/octet-stream"},
+            params={"uploadId": upload_id, "index": index}, content=part)
+        assert chunk.status_code == 200, chunk.text
+    return upload_id
+
+
+def test_duplicate_finalize_replays_original_result(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    upload_id = _upload_delta(module, client, task["taskId"],
+                              _delta_body(task["taskId"], module.MODEL_SIZE))
+    first = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert first.status_code == 200, first.text
+    second = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                         json={"uploadId": upload_id})
+    assert second.status_code == 200, second.text
+    assert second.json() == first.json()
+    assert len(list(module.pools.values())[0]["deltas"]) == 1
+    assert len(module.ORCH.submission.load_submissions(pool_id=list(module.pools)[0])) == 1
+
+
+def test_out_of_order_chunks_finalize(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE)
+    upload_id = _upload_delta(module, client, task["taskId"], payload,
+                              chunk_size=max(1, len(payload) // 3),
+                              order=[2, 0, 1])
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "success"
+
+
+def test_expired_ticket_is_rejected_with_reason(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    ticket = module.ORCH.admission.get("ip:10.0.0.2")
+    assert ticket is not None
+    assert ticket.signature and module.ORCH.admission.verify(ticket) is True
+    with module.ORCH.store.transaction() as conn:
+        conn.execute("UPDATE tickets SET expires_at=? WHERE client_key=?",
+                     (time.time() - 100, ticket.client_key))
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE)
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.2"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload),
+        "chunkSize": len(payload), "chunks": 1,
+        "checksum": hashlib.sha256(payload).hexdigest(),
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 2.5, "localSteps": 1, "tokensProcessed": 1234,
+    })
+    assert init.status_code == 403, init.text
+    assert init.json()["detail"]["reason"] == "ticket_expired"
+
+
+def test_finalize_replays_after_restart(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path)
+    first = _configure(_import_server(repo, monkeypatch), monkeypatch)
+    client = TestClient(first.app)
+    task = _two_client_task(first, client)
+    upload_id = _upload_delta(first, client, task["taskId"],
+                              _delta_body(task["taskId"], first.MODEL_SIZE))
+    original = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                           json={"uploadId": upload_id})
+    assert original.status_code == 200, original.text
+
+    second = _configure(_import_server(repo, monkeypatch), monkeypatch)
+    assert second._restore_orchestrator_state() is True
+    replay = TestClient(second.app).post(
+        "/fl/submit/finalize", headers=_headers("10.0.0.1"), json={"uploadId": upload_id})
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == original.json()

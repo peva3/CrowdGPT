@@ -183,13 +183,21 @@ duplicating work, and that never proxies bulk bytes.
 
 ### P1.2 Durable tickets and idempotent submission — SRV
 
-- [ ] Signed nonce tickets bound to `(round, base_weights, client, step_budget,
+- [x] Signed nonce tickets bound to `(round, base_weights, client, step_budget,
   token_budget, expires_at)`.
-- [ ] `submit/init|chunk|finalize` idempotent by ticket + content hash; retries
+- [x] `submit/init|chunk|finalize` idempotent by ticket + content hash; retries
   return the original result, never a second delta.
-- [ ] Expired tickets rejected with a machine-readable reason.
-- [ ] Tests: duplicate finalize, out-of-order chunks, replay after restart,
+- [x] Expired tickets rejected with a machine-readable reason.
+- [x] Tests: duplicate finalize, out-of-order chunks, replay after restart,
   expired ticket.
+- **Evidence:** Ed25519 `ng-ticket-1` payload (ticket id, client, round, task,
+  pool, timestamps, step/token budgets, nonce, `baseWeights=step:<n>`) signed by
+  `orchestrator_node_key.pem`; `/fl/task` returns the signed ticket; upload
+  rows persist from `init`, each chunk is recorded, and finalize stores its
+  response. Server `pytest tests -q` → 8 passed. `Crowdgpt-ng` harness → 6
+  passed: duplicate finalize replays the original body, out-of-order chunks
+  finalize, expired ticket returns `{"reason":"ticket_expired"}`, and finalize
+  replays after a simulated restart. Server commits `(local, no fork yet)`.
 
 ### P1.3 Presigned data plane — SRV/NG
 
