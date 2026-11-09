@@ -70,21 +70,22 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.1 Protocol schemas — NG
 
-- [ ] Define `Ticket`, `StepReceipt`, `RoundRecord`, `CheckpointRef`,
+- [x] Define `Ticket`, `StepReceipt`, `RoundRecord`, `CheckpointRef`,
   `NodeRecord` as immutable dataclasses in `crowdgpt_ng/protocol.py`.
-- [ ] Canonical JSON (sorted keys, compact separators, UTF-8) and SHA-256
+- [x] Canonical JSON (sorted keys, compact separators, UTF-8) and SHA-256
   digests; losses carried as fixed-precision decimal strings so hashes do not
   drift across platforms.
-- [ ] Merkle root over sorted leaf digests (duplicate-last), with inclusion
+- [x] Merkle root over sorted leaf digests (duplicate-last), with inclusion
   proof verification.
-- [ ] Ed25519 signing envelope (`sign_payload` / `verify_payload`) using
+- [x] Ed25519 signing envelope (`sign_payload` / `verify_payload`) using
   `cryptography`, with a clear error when the dependency is absent. No custom
   crypto.
-- [ ] Strict validation: required fields, schema version, round ≥ 0, step and
+- [x] Strict validation: required fields, schema version, round ≥ 0, step and
   token budgets > 0, timestamp shape, hex digest shape.
-- [ ] Tests: round-trip, canonical-stability, tamper detection, merkle proofs,
+- [x] Tests: round-trip, canonical-stability, tamper detection, merkle proofs,
   signature verify/reject, invalid-field rejection.
-- **Evidence:** `pytest tests/test_ng_protocol.py -q`
+- **Evidence:** `tests/test_ng_protocol.py` — 42 passed; full workspace suite
+  against `Crowdgpt-ng` — 213 passed, 3 skipped. Commit `ace53d6`.
 
 ### P0.2 Round-record exporter and backfill — NG
 
