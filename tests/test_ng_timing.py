@@ -94,3 +94,35 @@ def test_write_failure_does_not_raise(client_module, tmp_path):
     recorder.phase("queue", 0.1)
     recorder.finish(ok=False, error="OverflowError")
     assert recorder.enabled is True
+
+
+def test_unit_checkpoint_roundtrip(client_module, tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(client_module, "CHECKPOINT_DIR", tmp_path / "ckpt")
+    model = torch.nn.Linear(2, 2)
+    opt_a = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    opt_b = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model(torch.ones(1, 2)).sum().backward(); opt_a.step(); opt_b.step()
+    uc = client_module.UnitCheckpoint("task / 1", every=5)
+    uc.maybe_save(model, [opt_a, opt_b], micro_step=10, tt=123,
+                  loss_sum=4.5, loss_sq=2.1, loss_count=3)
+    assert uc.path.exists()
+
+    model2 = torch.nn.Linear(2, 2)
+    opt2_a = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    opt2_b = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    loaded = uc.load(model2, [opt2_a, opt2_b])
+    assert loaded["micro_step"] == 10 and loaded["tokens"] == 123
+    for a, b in zip(model.parameters(), model2.parameters()):
+        assert torch.equal(a, b)
+    uc.clear()
+    assert not uc.path.exists()
+
+
+def test_weight_cache_path_is_content_addressed(client_module, tmp_path, monkeypatch):
+    monkeypatch.setattr(client_module, "CHECKPOINT_DIR", tmp_path)
+    a = client_module._weight_blob_path("model", "a" * 64, 100, "rev1")
+    b = client_module._weight_blob_path("model", "a" * 64, 100, "rev2")
+    c = client_module._weight_blob_path("model", "b" * 64, 100, "rev1")
+    assert a == b, "same content id must reuse the cache across revisions"
+    assert a != c

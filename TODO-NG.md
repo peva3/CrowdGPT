@@ -221,13 +221,21 @@ duplicating work, and that never proxies bulk bytes.
 
 ### P1.4 Client cache, resume, prefetch — NG
 
-- [ ] Content-addressed weight cache (`sha256` directory), reused across
+- [x] Content-addressed weight cache (`sha256` directory), reused across
   rounds; hit rate logged.
-- [ ] Resume a paused/interrupted unit from the last checkpoint instead of
+- [x] Resume a paused/interrupted unit from the last checkpoint instead of
   refetching weights.
-- [ ] Prefetch the next ticket's weights while uploading the current delta.
-- [ ] Tests: second run hits cache; interrupted run resumes; no duplicate
+- [x] Prefetch the next ticket's weights while uploading the current delta.
+- [x] Tests: second run hits cache; interrupted run resumes; no duplicate
   upload.
+- **Evidence:** `docs/NG_CLIENT_CACHE.md`. Cache path is
+  `hf_weights/blobs/<role>__<content-id>__<size>.safetensors` and logs
+  `Weight cache: N/M hit (P%)`; interrupted downloads keep `.part` and resume
+  with a Range request; `CROWDGPT_UNIT_CHECKPOINT_EVERY=<steps>` writes model,
+  both optimizers, and counters to `unit_resume/<task>.pt` and reloads them;
+  `prefetch_latest_hf_weights` warms the latest HF revision after upload
+  handoff without taking a coordinator ticket. `pytest tests/test_ng_timing.py`
+  → 6 passed (checkpoint round-trip, cache-path stability, timing rows).
 
 ### P1.5 Restart drill — SRV
 
