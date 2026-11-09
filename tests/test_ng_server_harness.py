@@ -720,3 +720,21 @@ def test_lora_plus_engram_finalizes_with_both_updates(tmp_path, monkeypatch):
         assert set(meta["trainedParams"]) == {"adapters", "engram"}
         f.seek(meta_len + 4 + module.MODEL_SIZE * 2)
         assert struct.unpack("<I", f.read(4))[0] == rows
+
+
+def test_round_close_writes_round_metric(tmp_path, monkeypatch):
+    import json
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    path = module.DATA_DIR / "round_metrics.jsonl"
+    assert path.exists()
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["schema"] == "ng-metric-1"
+    assert row["round"] == module.round_state["current_round"]
+    assert row["accepted"] == 0 and row["deltas"] == 0
+    assert row["certified"] is False  # leader-signed only; witness quorum is P6.6
+    assert "ip" not in row and "secret" not in row
