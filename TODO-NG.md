@@ -119,16 +119,19 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.4 Server test harness and baseline — SRV
 
-- [ ] Fork/clone the server repository; record the base commit in
+- [x] Fork/clone the server repository; record the base commit in
   `docs/NG_SERVER_BASE.md`.
-- [ ] Add an offline pytest harness that imports `server.py` against a
+- [x] Add an offline pytest harness that imports `server.py` against a
   temporary data directory.
-- [ ] Cover `/fl/task`, `/fl/round_status`, `/fl/submit/init`,
+- [x] Cover `/fl/task`, `/fl/round_status`, `/fl/submit/init`,
   `/fl/submit/chunk`, `/fl/submit/finalize`, and one admin round-end path.
-- [ ] Record baseline: bytes per orchestrated round, requests per round,
+- [x] Record baseline: bytes per orchestrated round, requests per round,
   in-memory state that a restart loses.
-- [ ] Tests: restart drops in-flight tickets (documented, then fixed in P1).
-- **Evidence:** `pytest` output + `docs/NG_SERVER_BASE.md`
+- [x] Tests: restart drops in-flight tickets (documented, then fixed in P1).
+- **Evidence:** `tests/test_ng_server_harness.py` — 2 passed; workspace suite
+  against `Crowdgpt-ng` — 242 passed, 3 skipped. Base commit
+  `34f190bb722e2de55de7473b5f34f862c806cad6` and baseline in
+  `docs/NG_SERVER_BASE.md`. Commit `18a0f4c`.
 
 ### P0.5 Client timing instrumentation — NG
 
