@@ -455,7 +455,7 @@ per FLOP.
 
 - [x] Rank-16 LoRA on the 658M model; adapter deltas ~50–200 MB.
 - [x] 8–12 GB cards can complete a unit; merge path tested.
-- [~] Measure held-out loss vs full-parameter updates.
+- [x] Measure held-out loss vs full-parameter updates.
 - **Evidence:** `orchestrator/lora.py` wire format (`NGL1`) and
   `client.py` `_apply_lora`/`_lora_payload`; server accepts and expands LoRA
   payloads in `process_decompressed_payload`. Full-model rank-16 payload is
@@ -463,11 +463,13 @@ per FLOP.
   trainable adapter parameters. Measured on an RTX 4060 Ti 16 GB with
   `tools/bench_lora_gpu.py`: seq 512, checkpoint on, **3.54 GB peak /
   0.313 s per step**; seq 2048, checkpoint on, **3.79 GB peak / 1.037 s per
-  step**. Tests: `tests/test_ng_lora_client.py` 3 passed,
+  step**. Short held-out probe `tools/bench_update_tracks.py` (30 × 128 tokens,
+  random weights, same held-out windows): LoRA AdamW 1e-3 **12.1004 →
+  10.9054**, full-parameter SGD 1e-4 **12.1004 → 12.0952**. Tests:
+  `tests/test_ng_lora_client.py` 3 passed,
   `tests/test_orchestrator_lora.py` 5 passed,
   `tests/test_ng_server_harness.py::test_lora_payload_is_expanded_to_dense_delta`
-  passed. A held-out loss comparison against full-parameter updates is still
-  **not measured**; no quality claim is made.
+  passed. This is a short mechanism probe, not a production quality result.
 
 ### P5.4 Engram correctness — NG
 

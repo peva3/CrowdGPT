@@ -36,6 +36,24 @@ microbenchmark (`tools/bench_model_paths.py`) shows the same direction
 (1.82×) and a forward-loss delta of 0.00000000, which checks that the switch
 does not change the math.
 
+## LoRA vs full-parameter on a short held-out probe
+
+Command:
+
+    .venv/bin/python tools/bench_update_tracks.py --steps 30 --seq 128
+
+Random-initialised 658M model, repository text, 3,840 training tokens, the same
+four held-out windows. Measured on the RTX 4060 Ti 16 GB:
+
+| arm | trainable params | before | after | peak GB |
+|---|---|---|---|---|
+| LoRA rank 16, AdamW 1e-3 | 8,552,448 | 12.1004 | 10.9054 | 3.39 |
+| full, SGD 1e-4 | 657,788,928 | 12.1004 | 12.0952 | 6.69 |
+
+This is a 30-step mechanism probe, not evidence that LoRA is generally better
+than full-parameter training. The full arm used a lower learning rate after
+1e-3 diverged. Report it only with those qualifications.
+
 ## DiLoCo outer loop
 
 Command:
