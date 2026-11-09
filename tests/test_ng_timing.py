@@ -126,3 +126,11 @@ def test_weight_cache_path_is_content_addressed(client_module, tmp_path, monkeyp
     c = client_module._weight_blob_path("model", "b" * 64, 100, "rev1")
     assert a == b, "same content id must reuse the cache across revisions"
     assert a != c
+
+
+def test_orchestrator_failover_urls(client_module, monkeypatch):
+    monkeypatch.setenv("CROWDGPT_ORCHESTRATORS", "https://b.example,https://c.example")
+    urls = client_module.orchestrator_urls("https://a.example")
+    assert urls == ["https://a.example", "https://b.example", "https://c.example"]
+    assert client_module._failover_url("https://a.example/fl/submit", urls) == "https://b.example/fl/submit"
+    assert client_module._failover_url("https://c.example/fl/submit", urls) == "https://a.example/fl/submit"

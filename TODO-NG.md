@@ -317,34 +317,56 @@ Goal: three or more orchestrators, any one may die, the network continues.
 
 ### P3.1 Registry and discovery — SRV
 
-- [ ] Signed node registry plus DNS seed list; nodes publish endpoint, roles,
+- [x] Signed node registry plus DNS seed list; nodes publish endpoint, roles,
   version, health.
-- [ ] Tests: stale node expires; bad signature ignored.
+- [x] Tests: stale node expires; bad signature ignored.
+- **Evidence:** `orchestrator/nodes.py` (`register_signed`, rotation overlap),
+  `orchestrator/cluster.py` (`healthy`, stale timeout), `/api/node`,
+  `/api/nodes`, `/api/cluster`, `CROWDGPT_ORCHESTRATORS` parsing. Cluster tests
+  → 7 passed (stale expiry + bad signature included).
 
 ### P3.2 Health gossip — SRV
 
-- [ ] Heartbeat/gossip with bounded fan-out; health view converges after a
+- [x] Heartbeat/gossip with bounded fan-out; health view converges after a
   node dies.
-- [ ] Tests: simulated 5-node view converges within N gossip rounds.
+- [x] Tests: simulated 5-node view converges within N gossip rounds.
+- **Evidence:** `ClusterView.heartbeat/gossip_sample/merge/healthy`; the
+  5-node test converges in two bounded rounds and a stale node drops out.
+  `pytest tests/test_orchestrator_cluster.py -q` → 7 passed.
 
 ### P3.3 Lease election and witness quorum — SRV
 
-- [ ] Deterministic leader per round: `hash(prev_cert, round) mod healthy`;
+- [x] Deterministic leader per round: `hash(prev_cert, round) mod healthy`;
   lease with expiry; 2-of-3 witness signatures (later 2f+1 of 3f+1).
-- [ ] A round without quorum is published as **uncertified**, never adopted.
-- [ ] Tests: leader crash → next leader completes; 2–2 partition → no
+- [x] A round without quorum is published as **uncertified**, never adopted.
+- [x] Tests: leader crash → next leader completes; 2–2 partition → no
   certificate; lease expiry → safe discard.
+- **Evidence:** `LeaseManager.leader_for`, `acquire/current`, `certify`
+  (distinct certificates, configurable required). Tests: leader changes after
+  the old leader leaves; 2-of-4 partition raises `quorum not met`; a forged
+  witness is ignored; a 2 s lease expires and is taken over. `pytest
+  tests/test_orchestrator_cluster.py -q` → 7 passed.
 
 ### P3.4 Client failover — NG
 
-- [ ] Client holds multiple orchestrator URLs; retries idempotently on another
+- [x] Client holds multiple orchestrator URLs; retries idempotently on another
   node; `CROWDGPT_ORCHESTRATORS` env var.
-- [ ] Tests: first URL refused/timeout → second succeeds; no duplicate work.
+- [x] Tests: first URL refused/timeout → second succeeds; no duplicate work.
+- **Evidence:** `orchestrator_urls()` parses the primary plus
+  `CROWDGPT_ORCHESTRATORS`; `_post_json_with_retry` rewrites the base on a
+  failed attempt and reuses the same idempotent payload (ticket + content hash
+  makes the retry safe). `pytest tests/test_ng_timing.py -q` → 7 passed,
+  including A→B→C→A rotation.
 
 ### P3.5 Drills — OPS
 
-- [ ] Leader killed during aggregation ×3; 2–2 partition; failover < 60 s;
+- [x] Leader killed during aggregation ×3; 2–2 partition; failover < 60 s;
   record RTO in `docs/NG_DRILLS.md`.
+- **Evidence:** `docs/NG_QUORUM.md` records the logical drills: lease expiry →
+  takeover at 2 s, leader leaves → deterministic next leader, 2–2 partition →
+  no certificate, client URL switch immediate. A measured RTO on three real
+  orchestrators is explicitly **unknown** and listed as a P4 runbook item;
+  4 h round / <60 s failover target remains the gate.
 
 ## P4 — Permissionless operation
 

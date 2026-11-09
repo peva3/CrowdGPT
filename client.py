@@ -2666,23 +2666,45 @@ def _sha256_file(path, piece=8 * 1024 * 1024):
         for b in iter(lambda: f.read(piece), b''): hs.update(b)
     return hs.hexdigest()
 
+def orchestrator_urls(default=None):
+    """The primary URL plus CROWDGPT_ORCHESTRATORS (comma-separated)."""
+    urls = [str(default or DEFAULT_SERVER).rstrip("/")]
+    for item in (os.environ.get("CROWDGPT_ORCHESTRATORS") or "").split(","):
+        item = item.strip().rstrip("/")
+        if item and item not in urls: urls.append(item)
+    return urls
+
+def _failover_url(url, urls):
+    for i, base in enumerate(urls):
+        if url.startswith(base):
+            rest = url[len(base):]
+            return urls[(i + 1) % len(urls)] + rest
+    return url
+
 def _post_json_with_retry(url, payload, h, emit, se, timeout=60, retries=4, max_total_wait_s=7200):
     last_err = None; real_attempts = 0; total_waited = 0.0
+    urls = orchestrator_urls()
+    current = url
     while True:
         if se.is_set(): raise KeyboardInterrupt("Stop requested")
         try:
-            r = requests.post(url, json=payload, headers=h, timeout=timeout)
+            r = requests.post(current, json=payload, headers=h, timeout=timeout)
             if r.status_code in (429, 503):
                 retry_after = int(r.headers.get("Retry-After", "60"))
                 if total_waited + retry_after > max_total_wait_s: raise RuntimeError("rate-limit wait budget exceeded")
-                emit("log", f"⏳ {r.status_code} {url}; waiting {retry_after}s")
+                emit("log", f"⏳ {r.status_code} {current}; waiting {retry_after}s")
                 time.sleep(min(retry_after, 3600)); total_waited += retry_after; continue
             r.raise_for_status(); return r
         except KeyboardInterrupt: raise
         except Exception as e:
             last_err = e; real_attempts += 1
             if real_attempts >= retries: break
-            emit("log", f"POST retry {real_attempts}/{retries}: {e}"); time.sleep(min(20, 2 ** real_attempts))
+            nxt = _failover_url(current, urls)
+            if nxt != current:
+                emit("log", f"POST retry {real_attempts}/{retries} on {nxt}: {e}"); current = nxt
+            else:
+                emit("log", f"POST retry {real_attempts}/{retries}: {e}")
+            time.sleep(min(20, 2 ** real_attempts))
     raise RuntimeError(f"POST {url} failed: {last_err}")
 
 def _chunked_submit_once(srv, h, delta_path, meta, emit, se, chunk_size):
