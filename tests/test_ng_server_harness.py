@@ -738,3 +738,36 @@ def test_round_close_writes_round_metric(tmp_path, monkeypatch):
     assert row["accepted"] == 0 and row["deltas"] == 0
     assert row["certified"] is False  # leader-signed only; witness quorum is P6.6
     assert "ip" not in row and "secret" not in row
+
+
+def test_round_record_uses_evaluator_and_writes_nutrition(tmp_path, monkeypatch):
+    import json
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module._round_eval = lambda held: {
+        "mode": "heldout", "loss": "3.250000", "ciLow": "3.100000",
+        "ciHigh": "3.400000", "windows": 8, "manifestSha256": "a" * 64,
+        "source": "test-double",
+    }
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    rec = module.ORCH.publication.get_round(module.round_state["current_round"])["record"]
+    assert rec["eval"]["loss"] == "3.250000" and rec["eval"]["windows"] == 8
+    nutrition = json.loads((module.DATA_DIR / "nutrition.json").read_text())
+    assert nutrition["schema"] == "ng-nutrition-1"
+    assert nutrition["evaluation"]["loss"] == "3.250000"
+    assert nutrition["round"] == module.round_state["current_round"]
+    assert "ip" not in json.dumps(nutrition).lower() or "limitations" in nutrition
+
+
+def test_unevaluated_round_stays_explicit(tmp_path, monkeypatch):
+    import json
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    _two_client_task(module, client)
+    module._round_eval = lambda held: None
+    module._publish_round_record(module.round_state["current_round"], True, False, 1)
+    rec = module.ORCH.publication.get_round(module.round_state["current_round"])["record"]
+    assert rec["eval"] is None
+    nutrition = json.loads((module.DATA_DIR / "nutrition.json").read_text())
+    assert nutrition["evaluation"] == {"status": "unevaluated"}
