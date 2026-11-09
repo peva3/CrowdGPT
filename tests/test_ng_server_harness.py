@@ -126,7 +126,7 @@ def _configure(module, monkeypatch: pytest.MonkeyPatch):
     return module
 
 
-def _delta_body(task_id: str, params: int, *, loss: float = 2.5) -> bytes:
+def _delta_body(task_id: str, params: int, *, loss: float = 2.5, fill: float = 0.0) -> bytes:
     metadata = {
         "taskId": task_id,
         "weightFormat": "bf16",
@@ -137,7 +137,90 @@ def _delta_body(task_id: str, params: int, *, loss: float = 2.5) -> bytes:
         "loss": loss,
     }
     raw = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
-    return struct.pack("<I", len(raw)) + raw + (b"\x00\x00" * params)
+    values = b"\x00\x00" * params
+    if fill:
+        import torch
+        values = torch.full((params,), fill, dtype=torch.bfloat16).view(torch.int16).numpy().tobytes()
+    return struct.pack("<I", len(raw)) + raw + values
+
+
+def _lora_body(task_id: str, *, rank: int = 2, loss: float = 2.4) -> bytes:
+    import numpy as np
+    from orchestrator.lora import encode_payload
+
+    metadata = {
+        "taskId": task_id, "weightFormat": "bf16", "hasEngram": False,
+        "engramSparseCount": 0, "localSteps": 1, "tokensProcessed": 1234,
+        "loss": loss, "loraRank": rank, "isLoRA": True,
+    }
+    a = np.full((rank, 4), 0.5, dtype=np.float16)
+    b = np.full((4, rank), 0.5, dtype=np.float16)
+    payload = encode_payload([{"name": "blocks.0.attn.wq.weight", "offset": 0, "a": a, "b": b}])
+    raw = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<I", len(raw)) + raw + payload
+
+
+def test_diloco_aggregation_uses_persistent_outer_momentum(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE, fill=0.1)
+    upload_id = _upload_delta(module, client, task["taskId"], payload)
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    pool = list(module.pools.values())[0]
+    path = next(iter(pool["deltas"].values()))
+
+    module.OUTER_CONFIG["OPTIMIZER"] = "diloco"
+    module.OUTER_MOMENTUM_FILE = tmp_path / "outer_momentum.bin"
+    import torch
+    module.global_weights = torch.zeros(module.MODEL_SIZE)
+    module.global_step = 0
+    module.apply_round_aggregation([{"pool_id": pool["pool_id"], "deltas": [(path, 1.0)]}])
+
+    assert module.global_step == 1
+    assert float(module.global_weights[0]) != 0.0
+    assert module.OUTER_MOMENTUM_FILE.exists()
+    assert module.OUTER_MOMENTUM_FILE.stat().st_size == module.MODEL_SIZE * 4
+    assert not (module.WORK_TMP / "outer_pseudograd.f32").exists()
+
+
+def test_lora_payload_is_expanded_to_dense_delta(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _lora_body(task["taskId"])
+    assert len(payload) < 1024, "adapter payload must be far smaller than a dense delta"
+    checksum = hashlib.sha256(payload).hexdigest()
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.1"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload), "chunkSize": len(payload),
+        "chunks": 1, "checksum": checksum, "weightFormat": "bf16",
+        "hasEngram": False, "engramSparseCount": 0, "loss": 2.4,
+        "localSteps": 1, "tokensProcessed": 1234, "loraRank": 2, "isLoRA": True,
+    })
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["uploadId"]
+    chunk = client.post("/fl/submit/chunk", headers={
+        **_headers("10.0.0.1"), "Content-Type": "application/octet-stream"},
+        params={"uploadId": upload_id, "index": 0}, content=payload)
+    assert chunk.status_code == 200, chunk.text
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "success"
+    paths = list(module.pools.values())[0]["deltas"]
+    assert len(paths) == 1
+    stored = Path(next(iter(paths.values())))
+    assert stored.stat().st_size >= module.MODEL_SIZE * 2
+    # The reconstructed dense stream carries the adapter update at offset 0.
+    import torch
+    with open(stored, "rb") as f:
+        meta_len = struct.unpack("<I", f.read(4))[0]
+        f.read(meta_len)
+        dense = torch.frombuffer(bytearray(f.read(module.MODEL_SIZE * 2)),
+                                 dtype=torch.uint16).view(torch.bfloat16).float()
+    assert dense[0].item() > 0
 
 
 def test_pooled_round_flow_and_request_count(tmp_path, monkeypatch):

@@ -598,6 +598,13 @@ MAX_SEQ_LEN = MODEL_CONFIG["maxSeqLen"]; MLP_HIDDEN = MODEL_CONFIG["mlpHidden"]
 ENG_NUM_BUCKETS = 227865
 
 ENGRAM_ACTIVE = os.environ.get("CROWDGPT_ENGRAM", "1") == "1"
+# P5.3: train only low-rank adapters. Base weights stay frozen, so optimizer
+# state and the upload both shrink. Off by default until a pool opts in.
+LORA_ACTIVE = os.environ.get("CROWDGPT_LORA", "0").lower() in ("1", "true", "yes", "on")
+try: LORA_RANK = max(1, int(os.environ.get("CROWDGPT_LORA_RANK", "16")))
+except ValueError: LORA_RANK = 16
+try: LORA_ALPHA = float(os.environ.get("CROWDGPT_LORA_ALPHA", "32"))
+except ValueError: LORA_ALPHA = 32.0
 
 LOSS_CHUNK = 256; UPLOAD_BUFFER_MIN = 25; ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 SAFETY_MARGIN_GB = 1.0; ALLOCATOR_RESERVE_GB = 0.5; MIN_HEADROOM_GB = 0.25
@@ -1735,6 +1742,22 @@ def _sdpa_supports_gqa():
 
 _SDPA_GQA = _sdpa_supports_gqa()
 
+class LoRAAdapter(nn.Module):
+    """Low-rank update applied beside a frozen base linear layer."""
+    def __init__(self, out_features, in_features, rank, alpha=LORA_ALPHA):
+        super().__init__()
+        self.rank = int(rank); self.alpha = float(alpha)
+        self.A = nn.Parameter(torch.empty(self.rank, in_features).normal_(0.0, 0.01))
+        self.B = nn.Parameter(torch.zeros(out_features, self.rank))
+
+    def forward(self, x):
+        y = F.linear(F.linear(x, self.A), self.B)
+        return y * (self.alpha / self.rank)
+
+def _lin_lora(linear, adapter, x):
+    y = linear(x)
+    return y if adapter is None else y + adapter(x)
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1746,9 +1769,9 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x, cos, sin, use_chunked=True):
         B, T, C = x.size()
-        q = self.wq(x).view(B, T, self.nh, HEAD_DIM).transpose(1, 2)
-        k = self.wk(x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
-        v = self.wv(x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
+        q = _lin_lora(self.wq, getattr(self, "lora_wq", None), x).view(B, T, self.nh, HEAD_DIM).transpose(1, 2)
+        k = _lin_lora(self.wk, getattr(self, "lora_wk", None), x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
+        v = _lin_lora(self.wv, getattr(self, "lora_wv", None), x).view(B, T, self.nkv, HEAD_DIM).transpose(1, 2)
         ct, st = cos[:, :, :T, :], sin[:, :, :T, :]
         q = q * ct + rotate_half(q) * st
         k = k * ct + rotate_half(k) * st
@@ -1775,7 +1798,7 @@ class GroupedQueryAttention(nn.Module):
             except (TypeError, NotImplementedError, RuntimeError) as exc:
                 if not gqa or _is_oom(exc): raise
                 o = F.scaled_dot_product_attention(q, _expand_kv(k), _expand_kv(v), is_causal=True)
-        return self.wo(o.transpose(1, 2).contiguous().view(B, T, C))
+        return _lin_lora(self.wo, getattr(self, "lora_wo", None), o.transpose(1, 2).contiguous().view(B, T, C))
 
     def _chunked_attn(self, q, k, v, T, cs=64):
         chunks = []
@@ -1791,7 +1814,7 @@ class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
         self.w1 = nn.Linear(DIM, MLP_HIDDEN, bias=False); self.w2 = nn.Linear(DIM, MLP_HIDDEN, bias=False); self.w3 = nn.Linear(MLP_HIDDEN, DIM, bias=False)
-    def forward(self, x): return self.w3(F.silu(self.w1(x)) * self.w2(x))
+    def forward(self, x): return _lin_lora(self.w3, getattr(self, "lora_w3", None), F.silu(_lin_lora(self.w1, getattr(self, "lora_w1", None), x)) * _lin_lora(self.w2, getattr(self, "lora_w2", None), x))
 
 class Block(nn.Module):
     def __init__(self):
@@ -2763,6 +2786,52 @@ def chunked_submit_delta(srv, h, delta_path, meta, emit, se):
                 emit("log", f"Chunk too large. Reducing to {chunk_size / (1024 * 1024):.0f} MB and retrying."); continue
             raise
 
+def _apply_lora(model, rank, alpha=LORA_ALPHA):
+    """Freeze the base model and attach rank-r adapters to attention and MLP linears."""
+    for p in model.parameters(): p.requires_grad_(False)
+    targets = (("attn", "wq"), ("attn", "wk"), ("attn", "wv"), ("attn", "wo"),
+               ("mlp", "w1"), ("mlp", "w2"), ("mlp", "w3"))
+    for block in model.blocks:
+        for owner_name, linear_name in targets:
+            owner = getattr(block, owner_name)
+            linear = getattr(owner, linear_name)
+            rows, cols = int(linear.weight.shape[0]), int(linear.weight.shape[1])
+            adapter = LoRAAdapter(rows, cols, rank, alpha).to(linear.weight.device)
+            setattr(owner, f"lora_{linear_name}", adapter)
+    model.is_lora = True; model.lora_rank = int(rank); model.lora_alpha = float(alpha)
+    return model
+
+_LORA_MAGIC = b"NGL1"
+_LORA_HDR = struct.Struct("<HIIIH")
+
+def _lora_payload(model):
+    """Serialize adapters with the flat base-weight offset each one modifies."""
+    offsets = {}; o = 0
+    for n, p in model.named_parameters():
+        if n.startswith('engram.') or '.lora_' in n: continue
+        offsets[n] = o; o += p.numel()
+    items = []
+    for i, block in enumerate(model.blocks):
+        for owner, linear_name in (("attn", "wq"), ("attn", "wk"), ("attn", "wv"), ("attn", "wo"),
+                                   ("mlp", "w1"), ("mlp", "w2"), ("mlp", "w3")):
+            adapter = getattr(getattr(block, owner), f"lora_{linear_name}", None)
+            if adapter is None: continue
+            base_name = f"blocks.{i}.{owner}.{linear_name}.weight"
+            a = adapter.A.detach().to('cpu', torch.float16).numpy()
+            b = adapter.B.detach().to('cpu', torch.float16).numpy()
+            items.append({"name": base_name, "offset": offsets[base_name], "a": a, "b": b})
+    parts = [_LORA_MAGIC, struct.pack("<I", len(items))]
+    for item in items:
+        name = item["name"].encode(); a = item["a"]; b = item["b"]
+        parts.append(_LORA_HDR.pack(len(name), int(item["offset"]), int(b.shape[0]), int(a.shape[1]), int(a.shape[0])))
+        parts.append(name); parts.append(a.tobytes()); parts.append(b.tobytes())
+    return b"".join(parts)
+
+def _write_lora_delta_file(path, header_bytes, payload, level=6):
+    with open(path, 'wb') as f, gzip.GzipFile(fileobj=f, mode='wb', compresslevel=level) as gz:
+        gz.write(header_bytes); gz.write(payload)
+    return os.path.getsize(path)
+
 def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN,
                  u8_override=None, act_bytes_override=None, force_head_cpu=False):
     model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl,
@@ -2770,7 +2839,11 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN,
                     force_head_cpu=force_head_cpu)
     model.engram.table.to('cpu'); model.load_base_weights(iw)
     if ENGRAM_ACTIVE and ie is not None: model.engram.table.weight.data.copy_(ie.view(model.engram.table.weight.shape))
-    model.engram.table.to('cpu'); model.train(); return model
+    model.engram.table.to('cpu')
+    if LORA_ACTIVE:
+        _apply_lora(model, LORA_RANK, LORA_ALPHA)
+        emit('log', f"[LORA] rank {LORA_RANK} adapters active; base weights frozen")
+    model.train(); return model
 
 class _MultiOpt:
     def __init__(self, opts): self.opts = [o for o in opts if o is not None]
@@ -2783,8 +2856,8 @@ def _build_optimizers(model, lr=1e-4, force_mode=None):
     """force_mode: None = native, "adamw8bit" = force 8bit, "adamw32" = force fp32.
     Must be preserved across OOM-driven rebuilds (_on_step_down) or a client forced into an
     fp32 pool by the server will silently flip back to 8bit after a VRAM step-down."""
-    bp = [p for n, p in model.named_parameters() if not n.startswith('engram.')]
-    ep = list(model.engram.parameters())
+    bp = [p for n, p in model.named_parameters() if not n.startswith('engram.') and p.requires_grad]
+    ep = list(model.engram.parameters()) if any(p.requires_grad for p in model.engram.parameters()) else []
     groups = {}
     for p in bp: groups.setdefault(p.device.type, []).append(p)
     use_8bit = (_predict_optim(train_backend, force_mode=force_mode) == "adamw8bit"); opts = []
@@ -2798,8 +2871,11 @@ def _build_optimizers(model, lr=1e-4, force_mode=None):
         if o is None: o = torch.optim.AdamW(ps, lr=lr, betas=(0.9, 0.95), weight_decay=0.01, **({} if dev_type in ('cpu', 'cuda') else {"foreach": False}))
         opts.append(o)
     ob = _MultiOpt(opts)
-    try: oe = torch.optim.SparseAdam(ep, lr=lr)
-    except Exception: oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
+    if not ep:
+        oe = _MultiOpt([])
+    else:
+        try: oe = torch.optim.SparseAdam(ep, lr=lr)
+        except Exception: oe = torch.optim.AdamW(ep, lr=lr, weight_decay=0.01)
     return ob, oe
 
 def _clip_base_grads(model, max_norm=1.0):
@@ -2830,11 +2906,53 @@ def _write_base_delta_bf16(gz, model, iw_bf16, piece=16 * 1024 * 1024):
         flat = cur = d = None; p.data = torch.empty(0, dtype=p.dtype, device=p.device); o += s
     if o != iw_bf16.numel(): raise RuntimeError(f"delta size mismatch: {o} vs {iw_bf16.numel()}")
 
-def _engram_sparse_delta(table, iew_bf16, frac=0.10, chunk=32768):
+def _engram_select_rows(row_mass, max_frac=0.20, mass_frac=0.995):
+    """Choose engram rows by update mass instead of a blind top-10% count.
+
+    The old code always uploaded ``n * 0.10`` rows, even when only a handful had
+    changed, and dropped the remaining rows. This selects the smallest prefix of
+    rows sorted by |delta| that covers ``mass_frac`` of the total update mass,
+    capped at ``max_frac`` of the table. The returned ``covered``/``omitted``
+    fractions are the per-lookup L1 error bound when a held-out token hits one
+    of the omitted rows (each row's update norm is <= the omitted mass).
+    """
+    n = int(row_mass.numel())
+    empty = torch.empty(0, dtype=torch.long)
+    if n == 0:
+        return empty, 0.0, 0.0
+    total = float(row_mass.sum().item())
+    if not math.isfinite(total) or total <= 0.0:
+        return empty, 0.0, 0.0
+    max_frac = min(1.0, max(0.0, float(max_frac)))
+    mass_frac = min(1.0, max(0.0, float(mass_frac)))
+    budget = max(1, int(math.floor(n * max_frac)))
+    order = torch.argsort(row_mass, descending=True, stable=True)
+    ordered = row_mass[order]
+    cumulative = torch.cumsum(ordered, dim=0)
+    target = torch.tensor(total * mass_frac, dtype=cumulative.dtype)
+    need = int(torch.searchsorted(cumulative, target, right=False).item()) + 1
+    keep = min(n, budget, max(1, need))
+    selected = order[:keep]
+    selected = selected[row_mass[selected] > 1e-8]
+    if selected.numel() == 0:
+        return empty, 0.0, 0.0
+    covered = float(row_mass[selected].sum().item()) / total
+    return selected, covered, max(0.0, 1.0 - covered)
+
+
+def _engram_sparse_delta(table, iew_bf16, frac=None, chunk=32768):
     n = table.shape[0]; rn = torch.empty(n)
     for i in range(0, n, chunk): rn[i:i + chunk] = (table[i:i + chunk] - iew_bf16[i:i + chunk].float()).abs().sum(dim=1)
-    k = max(1, int(n * frac)); tv, ti = torch.topk(rn, k); ai = ti[tv > 1e-8]
+    max_frac = frac
+    if max_frac is None:
+        try: max_frac = float(os.environ.get("CROWDGPT_ENGRAM_DELTA_MAX_FRAC", "0.20"))
+        except (TypeError, ValueError): max_frac = 0.20
+    try: mass_frac = float(os.environ.get("CROWDGPT_ENGRAM_DELTA_MASS", "0.995"))
+    except (TypeError, ValueError): mass_frac = 0.995
+    ai, covered, omitted = _engram_select_rows(rn, max_frac=max_frac, mass_frac=mass_frac)
     if len(ai) == 0: return np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
+    if omitted > 1e-4:
+        log.info(f"[ENGRAM] sparse delta covers {covered:.4%} of update mass; omitted {omitted:.4%} (cap {max_frac:.0%} rows)")
     sv = (table[ai] - iew_bf16[ai].float()).to(torch.bfloat16).view(torch.int16).numpy().view(np.uint16)
     return ai.numpy().astype(np.uint32), sv
 
@@ -3286,7 +3404,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         for _p in model.parameters(): _p.grad = None
         _clear_accel_cache(train_device); _trim_heap()
 
-        if ENGRAM_ACTIVE and iew is not None:
+        if not LORA_ACTIVE and ENGRAM_ACTIVE and iew is not None:
             si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
             if len(si) > 0: emit('log', f"[ENGRAM] uploading {len(si):,} sparse row updates")
         else: si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
@@ -3323,16 +3441,24 @@ def run_single_round_wrapper(srv, at, se, emit):
                                      "receiptSig": _key.sign(_body).hex()})
         except Exception as _re:
             log.debug(f"receipt skipped: {_re}")
-        pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, "loraRank": 0, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}).encode()
+        _lora_meta = {"loraRank": int(LORA_RANK), "isLoRA": True} if LORA_ACTIVE else {"loraRank": 0, "isLoRA": False}
+        pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, ** _lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}).encode()
         delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR)); os.close(delta_fd)
-        try: delta_size = _write_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, model, iw, (si, sv))
+        try:
+            if LORA_ACTIVE:
+                _lp = _lora_payload(model)
+                delta_size = _write_lora_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, _lp)
+                emit('log', f"[LORA] adapter payload {delta_size / (1024 * 1024):.1f} MB")
+                _lp = None
+            else:
+                delta_size = _write_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, model, iw, (si, sv))
         except BaseException:
             try: os.unlink(delta_path)
             except OSError: pass
             raise
         finally: iw = None; model = None; del si, sv, pl; _clear_accel_cache(train_device); _trim_heap()
         
-        upload_size_mb = delta_size / (1024 * 1024); meta = {"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, "loraRank": 0, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}
+        upload_size_mb = delta_size / (1024 * 1024); meta = {"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, **_lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}
         timing_handoff = _submit_delta_background(srv, h, delta_path, delta_size, meta, emit, se, hb=hb, timing=timing)   # discards the delta if refused
         uck.clear()
         threading.Thread(target=prefetch_latest_hf_weights, args=(se, emit), daemon=True).start()
