@@ -228,13 +228,20 @@ class _NoHeartbeat:
 
 class ImportIsolation(unittest.TestCase):
     def test_import_leaves_stdio_and_logging_untouched(self):
-        self.assertIs(sys.stdout, _STDIO_BEFORE[0])
-        self.assertIs(sys.stderr, _STDIO_BEFORE[1])
+        # Compare around a fresh import. Snapshotting at module import is fragile: pytest's logging
+        # plugin installs and removes its capture handlers between collection and each test phase.
+        root = logging.getLogger()
+        before = (sys.stdout, sys.stderr, list(root.handlers), root.level)
+        _, tmp = _load_client()
+        shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIs(sys.stdout, before[0])
+        self.assertIs(sys.stderr, before[1])
+        self.assertEqual(list(root.handlers), before[2])
+        self.assertEqual(root.level, before[3])
         for s in (sys.stdout, sys.stderr):
             self.assertFalse(s.closed)
             if getattr(s, "buffer", None) is not None: self.assertFalse(s.buffer.closed)
             s.write(""); s.flush()
-        self.assertEqual(logging.getLogger().handlers, _ROOT_HANDLERS_BEFORE)
         for name in _STUBBED:
             self.assertNotIsInstance(sys.modules.get(name), mock.MagicMock)
 
