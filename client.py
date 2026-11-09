@@ -1343,6 +1343,8 @@ def _hardware_headers(force_mode=None):
         "X-Client-Engram":    "1" if ENGRAM_ACTIVE else "0",
         "X-Client-Device":    DEVICE_ID,
         "X-Client-Compute-Cap": _cc,   # NEW
+        "X-Client-Train-Mode": "lora" if LORA_ACTIVE else "dense",
+        "X-Client-Lora-Rank":  str(LORA_RANK if LORA_ACTIVE else 0),
         "X-Client-Version":   CLIENT_VERSION,
         **({"X-Client-Pubkey": _client_identity()[1]} if _client_identity()[1] else {}),
     }
@@ -2827,9 +2829,14 @@ def _lora_payload(model):
         parts.append(name); parts.append(a.tobytes()); parts.append(b.tobytes())
     return b"".join(parts)
 
-def _write_lora_delta_file(path, header_bytes, payload, level=6):
+def _write_lora_delta_file(path, header_bytes, payload, engram=None, level=6):
     with open(path, 'wb') as f, gzip.GzipFile(fileobj=f, mode='wb', compresslevel=level) as gz:
         gz.write(header_bytes); gz.write(payload)
+        si, sv = engram if engram is not None else (None, None)
+        if si is not None and len(si) > 0:
+            gz.write(struct.pack('<I', len(si)))
+            gz.write(si.tobytes())
+            gz.write(sv.tobytes())
     return os.path.getsize(path)
 
 def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN,
@@ -2842,7 +2849,9 @@ def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN,
     model.engram.table.to('cpu')
     if LORA_ACTIVE:
         _apply_lora(model, LORA_RANK, LORA_ALPHA)
-        emit('log', f"[LORA] rank {LORA_RANK} adapters active; base weights frozen")
+        if ENGRAM_ACTIVE and hasattr(model, "engram"):
+            for p in model.engram.parameters(): p.requires_grad_(True)
+        emit('log', f"[LORA] rank {LORA_RANK} adapters active; base frozen, engram trainable")
     model.train(); return model
 
 class _MultiOpt:
@@ -3404,7 +3413,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         for _p in model.parameters(): _p.grad = None
         _clear_accel_cache(train_device); _trim_heap()
 
-        if not LORA_ACTIVE and ENGRAM_ACTIVE and iew is not None:
+        if ENGRAM_ACTIVE and iew is not None:
             si, sv = _engram_sparse_delta(model.engram.table.weight.data, iew)
             if len(si) > 0: emit('log', f"[ENGRAM] uploading {len(si):,} sparse row updates")
         else: si, sv = np.array([], dtype=np.uint32), np.array([], dtype=np.uint16)
@@ -3441,13 +3450,20 @@ def run_single_round_wrapper(srv, at, se, emit):
                                      "receiptSig": _key.sign(_body).hex()})
         except Exception as _re:
             log.debug(f"receipt skipped: {_re}")
-        _lora_meta = {"loraRank": int(LORA_RANK), "isLoRA": True} if LORA_ACTIVE else {"loraRank": 0, "isLoRA": False}
+        if LORA_ACTIVE:
+            _trained = ["adapters"] + (["engram"] if has_engram else [])
+            _lora_meta = {"loraRank": int(LORA_RANK), "isLoRA": True,
+                          "trainMode": "lora", "trainedParams": _trained}
+        else:
+            _trained = ["base"] + (["engram"] if has_engram else [])
+            _lora_meta = {"loraRank": 0, "isLoRA": False,
+                          "trainMode": "dense", "trainedParams": _trained}
         pl = json.dumps({"taskId": tid, "loss": fl, "localSteps": micro_step, "tokensProcessed": tt, ** _lora_meta, "isDelta": True, "weightFormat": "bf16", "hasEngram": has_engram, "engramSparseCount": engram_sparse_count, **submit_extra}).encode()
         delta_fd, delta_path = tempfile.mkstemp(prefix="delta-", suffix=".gz", dir=str(CHECKPOINT_DIR)); os.close(delta_fd)
         try:
             if LORA_ACTIVE:
                 _lp = _lora_payload(model)
-                delta_size = _write_lora_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, _lp)
+                delta_size = _write_lora_delta_file(delta_path, struct.pack('<I', len(pl)) + pl, _lp, (si, sv))
                 emit('log', f"[LORA] adapter payload {delta_size / (1024 * 1024):.1f} MB")
                 _lp = None
             else:

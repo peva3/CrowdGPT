@@ -41,8 +41,8 @@ pytestmark = pytest.mark.skipif(
 _counter = itertools.count(1)
 
 
-def _headers(ip: str) -> dict[str, str]:
-    return {
+def _headers(ip: str, *, mode: str = "dense", rank: int = 0) -> dict[str, str]:
+    headers = {
         "X-Forwarded-For": ip,
         "X-Client-Version": "3.2",
         "X-Client-Backend": "CUDA",
@@ -52,6 +52,10 @@ def _headers(ip: str) -> dict[str, str]:
         "X-Client-Autocast": "bf16",
         "X-Client-Optim": "adamw",
     }
+    if mode == "lora":
+        headers["X-Client-Train-Mode"] = "lora"
+        headers["X-Client-Lora-Rank"] = str(rank)
+    return headers
 
 
 def _prepare_repo(tmp_path: Path) -> Path:
@@ -189,7 +193,7 @@ def test_diloco_aggregation_uses_persistent_outer_momentum(tmp_path, monkeypatch
 def test_lora_payload_is_expanded_to_dense_delta(tmp_path, monkeypatch):
     module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
     client = TestClient(module.app)
-    task = _two_client_task(module, client)
+    task = _two_client_task(module, client, mode="lora", rank=2)
     payload = _lora_body(task["taskId"])
     assert len(payload) < 1024, "adapter payload must be far smaller than a dense delta"
     checksum = hashlib.sha256(payload).hexdigest()
@@ -198,11 +202,12 @@ def test_lora_payload_is_expanded_to_dense_delta(tmp_path, monkeypatch):
         "chunks": 1, "checksum": checksum, "weightFormat": "bf16",
         "hasEngram": False, "engramSparseCount": 0, "loss": 2.4,
         "localSteps": 1, "tokensProcessed": 1234, "loraRank": 2, "isLoRA": True,
+        "trainedParams": ["adapters"],
     })
     assert init.status_code == 200, init.text
     upload_id = init.json()["uploadId"]
     chunk = client.post("/fl/submit/chunk", headers={
-        **_headers("10.0.0.1"), "Content-Type": "application/octet-stream"},
+        **_headers("10.0.0.1", mode="lora", rank=2), "Content-Type": "application/octet-stream"},
         params={"uploadId": upload_id, "index": 0}, content=payload)
     assert chunk.status_code == 200, chunk.text
     final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
@@ -345,10 +350,11 @@ def test_restart_reconstructs_round_pools_and_tickets(tmp_path, monkeypatch):
     assert second.client_pool_map, "pool membership should be reconstructed"
 
 
-def _two_client_task(module, client):
-    assert client.get("/fl/task", headers=_headers("10.0.0.1"),
-                      params={"skip_weights": "true"}).json()["status"] == "wait"
-    second = client.get("/fl/task", headers=_headers("10.0.0.2"),
+def _two_client_task(module, client, *, mode: str = "dense", rank: int = 0):
+    first = client.get("/fl/task", headers=_headers("10.0.0.1", mode=mode, rank=rank),
+                       params={"skip_weights": "true"})
+    assert first.json()["status"] == "wait"
+    second = client.get("/fl/task", headers=_headers("10.0.0.2", mode=mode, rank=rank),
                         params={"skip_weights": "true"}).json()
     assert second["taskId"]
     return second
@@ -615,3 +621,102 @@ def test_implausible_loss_is_rejected(tmp_path, monkeypatch):
     final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.2"), json={"uploadId": up})
     assert final.status_code == 400, final.text
     assert final.json()["detail"]["reason"] == "implausible_loss"
+
+
+def test_dense_and_lora_clients_form_separate_pools(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    dense = client.get("/fl/task", headers=_headers("10.0.0.1"),
+                       params={"skip_weights": "true"})
+    assert dense.json()["status"] == "wait"
+    lora = client.get("/fl/task", headers=_headers("10.0.0.2", mode="lora", rank=2),
+                      params={"skip_weights": "true"})
+    assert lora.json()["status"] == "wait"
+    assert len(module.pools) == 2
+    assert all(len(pool["clients"]) == 1 for pool in module.pools.values())
+
+
+def test_lora_submit_to_dense_task_is_rejected(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _lora_body(task["taskId"])
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.2"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload), "chunkSize": len(payload),
+        "chunks": 1, "checksum": hashlib.sha256(payload).hexdigest(),
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 2.4, "localSteps": 1, "tokensProcessed": 1234,
+        "loraRank": 2, "isLoRA": True, "trainedParams": ["adapters"],
+    })
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["uploadId"]
+    chunk = client.post("/fl/submit/chunk", headers={
+        **_headers("10.0.0.2"), "Content-Type": "application/octet-stream"},
+        params={"uploadId": upload_id, "index": 0}, content=payload)
+    assert chunk.status_code == 200, chunk.text
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.2"),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 400, final.text
+    assert final.json()["detail"]["reason"] == "train_mode_mismatch"
+
+
+def test_lora_plus_engram_finalizes_with_both_updates(tmp_path, monkeypatch):
+    import numpy as np
+    import torch
+    from orchestrator.lora import encode_payload
+
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    module.ENG_PARAMS = 16
+    module.ENG_NUM_BUCKETS = 4
+    module.global_engram_weights = torch.zeros(16)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client, mode="lora", rank=2)
+    assert task["trainMode"] == "lora"
+    assert task["loraRank"] == 2
+    assert set(task["trainedParams"]) == {"adapters", "engram"}
+
+    a = np.full((2, 4), 0.5, dtype=np.float16)
+    b = np.full((4, 2), 0.5, dtype=np.float16)
+    adapters = encode_payload([{"name": "blocks.0.attn.wq.weight", "offset": 0, "a": a, "b": b}])
+    rows = 2
+    tail = (struct.pack("<I", rows)
+            + np.array([0, 1], dtype=np.uint32).tobytes()
+            + torch.full((rows, 4), 0.5, dtype=torch.bfloat16).view(torch.int16).numpy().tobytes())
+    metadata = {
+        "taskId": task["taskId"], "weightFormat": "bf16", "hasEngram": True,
+        "engramSparseCount": rows, "localSteps": 1, "tokensProcessed": 1234,
+        "loss": 2.4, "loraRank": 2, "isLoRA": True,
+        "trainedParams": ["adapters", "engram"],
+    }
+    raw = json.dumps(metadata, separators=(",", ":")).encode()
+    payload = struct.pack("<I", len(raw)) + raw + adapters + tail
+
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.1", mode="lora", rank=2), json={
+        "taskId": task["taskId"], "totalBytes": len(payload), "chunkSize": len(payload),
+        "chunks": 1, "checksum": hashlib.sha256(payload).hexdigest(),
+        "weightFormat": "bf16", "hasEngram": True, "engramSparseCount": rows,
+        "loss": 2.4, "localSteps": 1, "tokensProcessed": 1234,
+        "loraRank": 2, "isLoRA": True, "trainedParams": ["adapters", "engram"],
+    })
+    assert init.status_code == 200, init.text
+    upload_id = init.json()["uploadId"]
+    chunk = client.post("/fl/submit/chunk", headers={
+        **_headers("10.0.0.1", mode="lora", rank=2),
+        "Content-Type": "application/octet-stream"},
+        params={"uploadId": upload_id, "index": 0}, content=payload)
+    assert chunk.status_code == 200, chunk.text
+    final = client.post("/fl/submit/finalize",
+                        headers=_headers("10.0.0.1", mode="lora", rank=2),
+                        json={"uploadId": upload_id})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "success"
+
+    pool = list(module.pools.values())[0]
+    stored = Path(next(iter(pool["deltas"].values())))
+    with open(stored, "rb") as f:
+        meta_len = struct.unpack("<I", f.read(4))[0]
+        meta = json.loads(f.read(meta_len))
+        assert meta["trainMode"] == "lora"
+        assert set(meta["trainedParams"]) == {"adapters", "engram"}
+        f.seek(meta_len + 4 + module.MODEL_SIZE * 2)
+        assert struct.unpack("<I", f.read(4))[0] == rows
