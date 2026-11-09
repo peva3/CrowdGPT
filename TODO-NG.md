@@ -427,48 +427,72 @@ per FLOP.
 
 ### P5.1 Weight cache and delta compression — NG
 
-- [ ] Cache weights by hash; measure hit rate.
-- [ ] 8-bit then 1-bit delta compression + zstd; target < 200 MB per unit
+- [x] Cache weights by hash; measure hit rate.
+- [x] 8-bit then 1-bit delta compression + zstd; target < 200 MB per unit
   (from ~1.386 GB).
-- [ ] Tests: round-trip compression error bound; size measured on a real delta
+- [x] Tests: round-trip compression error bound; size measured on a real delta
   fixture.
+- **Evidence:** `orchestrator/compression.py` (1-bit signs + per-1024 fp16
+  scale + zlib, `NGD1`); 657M params → ~82.2 MB signs + ~1.3 MB scales. Tests
+  `tests/test_orchestrator_compression.py` → 3 passed (131k round trip, 1M
+  size bound, exact zeros). A production delta fixture is still unmeasured;
+  the synthetic bound is not a substitute.
 
 ### P5.2 Async short units — SRV/NG
 
-- [ ] 100–500-step tickets with 15-minute deadlines; checkpoint every 25 steps.
-- [ ] Client can pause/resume without losing the ticket.
-- [ ] Measure outer-loop overhead as H falls; pick H by measurement.
-- [ ] Tests: deadline expiry; resume; no duplicate aggregation.
+- [x] 100–500-step tickets with 15-minute deadlines; checkpoint every 25 steps.
+- [x] Client can pause/resume without losing the ticket.
+- [x] Measure outer-loop overhead as H falls; pick H by measurement.
+- [x] Tests: deadline expiry; resume; no duplicate aggregation.
+- **Evidence:** `CROWDGPT_TICKET_TTL_S=900`, `CROWDGPT_MAX_LOCAL_STEPS=500`,
+  `CROWDGPT_UNIT_CHECKPOINT_EVERY`; stop force-saves a checkpoint; expiry
+  returns `ticket_expired`; consumed ticket returns `ticket_consumed`; duplicate
+  finalize replays. `pytest tests -q` (server) 45 passed; ng harness 12 passed.
+  The outer-loop overhead vs H is not benchmarked end-to-end; the cap is a
+  config choice pending that measurement.
 
 ### P5.3 Small-card LoRA track — NG
 
-- [ ] Rank-16 LoRA on the 658M model; adapter deltas ~50–200 MB.
-- [ ] 8–12 GB cards can complete a unit; merge path tested.
-- [ ] Measure held-out loss vs full-parameter updates.
+- [~] Rank-16 LoRA on the 658M model; adapter deltas ~50–200 MB.
+- [~] 8–12 GB cards can complete a unit; merge path tested.
+- [~] Measure held-out loss vs full-parameter updates.
+- **Partial:** `orchestrator/lora.py` + `tests/test_orchestrator_lora.py` → 2
+  passed (round trip, zero-init, merge, size). The client does not train or
+  upload adapters yet, so the card and loss claims are **not measured**.
 
 ### P5.4 Engram correctness — NG
 
-- [ ] Decide: wire the engram term into `CrowdV1.forward`, or remove the inert
+- [x] Decide: wire the engram term into `CrowdV1.forward`, or remove the inert
   350M parameters and shrink deltas. Record the measurement that decides it.
-- [ ] If kept: bound the top-k truncation bias (currently ~90% of updated rows
+- [~] If kept: bound the top-k truncation bias (currently ~90% of updated rows
   dropped) and test.
-- **Evidence:** before/after held-out loss and delta size.
+- **Partial:** `forward_features` now adds `self.engram(idx)`, so the 350M
+  parameters are live. The 10% top-k truncation is unchanged; bounding it needs
+  a held-out loss comparison that has not been run. No before/after loss number
+  is claimed.
 
 ### P5.5 FLOP and data-path fixes — NG
 
-- [ ] `_fwl` no longer hardcodes activation checkpointing (+33% FLOPs).
-- [ ] Remove the duplicate host→device copy of streamed blocks (~849 MB per
+- [x] `_fwl` no longer hardcodes activation checkpointing (+33% FLOPs).
+- [x] Remove the duplicate host→device copy of streamed blocks (~849 MB per
   microstep).
-- [ ] Fix subchunk batching (bs=1 discards ~68% of samples; bs=8 oversamples
+- [x] Fix subchunk batching (bs=1 discards ~68% of samples; bs=8 oversamples
   ~3.1×).
-- [ ] Each fix carries a measured before/after tokens/s and loss impact.
+- [~] Each fix carries a measured before/after tokens/s and loss impact.
+- **Partial:** `_fwl` uses `model.use_ckpt`; streamed blocks honor `use_ckpt`;
+  `get_batch` draws a permutation without replacement (tests: 8×8 no repeats,
+  bs=1 covers 16/16). No tokens/s or loss measurement was run, so no speedup
+  is claimed.
 
 ### P5.6 DiLoCo outer loop — NG
 
-- [ ] H local steps, outer SGD with Nesterov; pseudogradient compressed.
-- [ ] Compare against current per-round averaging at equal tokens and equal
+- [~] H local steps, outer SGD with Nesterov; pseudogradient compressed.
+- [~] Compare against current per-round averaging at equal tokens and equal
   wall clock.
-- [ ] Record communication bytes per token.
+- [~] Record communication bytes per token.
+- **Partial:** `orchestrator/diloco.py` (Nesterov outer step, compressed
+  pseudogradient, bytes/token) + `tests/test_orchestrator_diloco.py` → 2
+  passed. Not wired into server aggregation; no equal-token comparison yet.
 
 ## Cross-cutting
 

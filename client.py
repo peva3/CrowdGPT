@@ -232,8 +232,9 @@ class UnitCheckpoint:
             self.clear()
             return None
 
-    def maybe_save(self, model, optimizers, *, micro_step, tt, loss_sum, loss_sq, loss_count):
-        if not self.enabled or micro_step - self._last < self.every: return
+    def maybe_save(self, model, optimizers, *, micro_step, tt, loss_sum, loss_sq, loss_count,
+                   force=False):
+        if not self.enabled or (not force and micro_step - self._last < self.every): return
         self._last = micro_step
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
@@ -1927,9 +1928,15 @@ class SotaGPT(nn.Module):
             else:
                 if getattr(self, 'cache_streamed_params', False):
                     params = _streamed_block_params(block, dev, stream_dtype)
-                    x = checkpoint(_streamed_block_cached, block, params, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                    if use_ckpt:
+                        x = checkpoint(_streamed_block_cached, block, params, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                    else:
+                        x = _streamed_block_cached(block, params, dev, stream_dtype, x, cos, sin, use_chunked)
                 else:
-                    x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                    if use_ckpt:
+                        x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                    else:
+                        x = _streamed_block(block, dev, stream_dtype, x, cos, sin, use_chunked)
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True): return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
@@ -1960,6 +1967,7 @@ class StreamingShardDataset:
         self.repo_id = repo_id; self.ci = ci; self.sub_size = ss; self.tps = tps; self.auth_token = at
         self.cohort_mode = cohort_mode; self._fmt = "chunk_{:04d}.bin"; self.chunk_size = self._discover(ci)
         self.off = (slot * ss) % self.chunk_size; self.data = None; self.n = 0; self.steps_used = 0
+        self._order = None; self._pos = 0
         self._pft = None; self._pfr = None; self._lock = threading.Lock(); self._load(self.off); self._prefetch(self.off + ss)
 
     def _url(self): return f"https://huggingface.co/datasets/{self.repo_id}/resolve/main/chunks/" + self._fmt.format(self.ci)
@@ -1982,6 +1990,7 @@ class StreamingShardDataset:
 
     def _set(self, raw):
         tk = np.frombuffer(raw, dtype=np.uint32); self.data = tk; self.n = len(tk) // self.tps; self.steps_used = 0
+        self._order = None; self._pos = 0
 
     def _load(self, off): self._set(self._slice(off)); self.off = off
 
@@ -2033,7 +2042,13 @@ class StreamingShardDataset:
     def get_batch(self, bs, seed=None):
         if self.data is None or self.n == 0: self.advance()
         self.steps_used += 1
-        rng = np.random.RandomState(seed); s = rng.randint(0, self.n, size=bs) * self.tps
+        bs = max(1, int(bs))
+        if self._order is None or self._pos + bs > self.n:
+            rng = np.random.RandomState(seed)
+            self._order = rng.permutation(self.n)
+            self._pos = 0
+        s = self._order[self._pos:self._pos + bs] * self.tps
+        self._pos += bs
         inp = np.stack([self.data[x:x + self.tps - 1] for x in s]); tgt = np.stack([self.data[x + 1:x + self.tps] for x in s])
         return torch.tensor(inp, dtype=torch.long), torch.tensor(tgt, dtype=torch.long)
 
@@ -3244,7 +3259,12 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         timing.phase("train", time.monotonic() - _train_t0, tokens=tt, steps=micro_step)
 
-        if se.is_set(): emit('log', "Stopped by user. Skipping upload."); return
+        if se.is_set():
+            uck.maybe_save(model, [ob, oe], micro_step=micro_step, tt=tt,
+                           loss_sum=round_loss_sum, loss_sq=round_loss_sq_sum,
+                           loss_count=round_loss_count, force=True)
+            emit('log', f"Stopped by user at step {micro_step}; unit checkpoint kept for resume.")
+            return
         if hb.should_stop(): emit('log', f"Stopped mid-training (round {cr} ended or task gone); discarding partial delta, no upload."); return
         hb.tid = None
         if cohort_mode and int(micro_step) != int(cc_steps): emit('log', f"[COHORT] only completed {micro_step}/{cc_steps} steps; aborting upload"); return
