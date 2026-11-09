@@ -771,3 +771,26 @@ def test_unevaluated_round_stays_explicit(tmp_path, monkeypatch):
     assert rec["eval"] is None
     nutrition = json.loads((module.DATA_DIR / "nutrition.json").read_text())
     assert nutrition["evaluation"] == {"status": "unevaluated"}
+
+
+def test_leaderboard_endpoints_label_provenance(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    verified = client.get("/api/leaderboard/verified")
+    reported = client.get("/api/leaderboard/reported")
+    assert verified.status_code == 200 and verified.json()["source"] == "verified"
+    assert reported.status_code == 200 and reported.json()["source"] == "reported"
+
+
+def test_proposal_surface_requires_verified_weight_to_vote(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    made = client.post("/api/proposals", headers=_headers("10.0.0.1"),
+                       json={"title": "next", "body": "more eval"})
+    assert made.status_code == 200, made.text
+    pid = made.json()["proposalId"]
+    listed = client.get("/api/proposals").json()["proposals"]
+    assert any(p["proposalId"] == pid for p in listed)
+    denied = client.post(f"/api/proposals/{pid}/vote", headers=_headers("10.0.0.1"))
+    assert denied.status_code == 403
+    assert denied.json()["detail"]["reason"] == "verified_contributor_required"
