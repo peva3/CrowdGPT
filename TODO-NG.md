@@ -135,13 +135,16 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.5 Client timing instrumentation — NG
 
-- [ ] Behind `CROWDGPT_TIMING_LOG=<path>`, append one JSONL row per phase:
+- [x] Behind `CROWDGPT_TIMING_LOG=<path>`, append one JSONL row per phase:
   queue wait, weight fetch, training, delta upload, total; include bytes and
   token count.
-- [ ] No behavior change when the variable is unset; no secrets or IPs.
-- [ ] Tests: unset → no file; set → valid JSONL; failure paths still emit a
+- [x] No behavior change when the variable is unset; no secrets or IPs.
+- [x] Tests: unset → no file; set → valid JSONL; failure paths still emit a
   row with `ok=false`.
-- **Evidence:** `pytest tests/test_ng_timing.py -q`
+- **Evidence:** `tests/test_ng_timing.py` — 4 passed; workspace suite against
+  `Crowdgpt-ng` — 242 passed, 3 skipped. The recorder is embedded in
+  `client.py` because the auto-updated single-file client cannot import the
+  `crowdgpt_ng` package. Commit `06e99dd`.
 
 ### P0.6 Baseline report — OPS
 
