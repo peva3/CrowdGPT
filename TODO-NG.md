@@ -89,17 +89,19 @@ measure the system we actually have. No behavior change to training.
 
 ### P0.2 Round-record exporter and backfill — NG
 
-- [ ] `crowdgpt_ng/records.py` normalises the artifacts the server already
+- [x] `crowdgpt_ng/records.py` normalises the artifacts the server already
   publishes (`status.json`, `leaderboard.json`, `loss_history.json`) into one
   append-only `rounds.jsonl` record per round.
-- [ ] Every record labels `source` and `verification` (`reported`, `checked`,
-  `none`); reported and checked values are separate fields, never summed.
-- [ ] Deterministic output: same inputs → byte-identical file.
-- [ ] Backfill the available window into `data/rounds.jsonl` (or document why
-  the artifact is unavailable).
-- [ ] Tests with fixtures for the three input shapes, missing rounds, duplicate
+- [x] Every record labels `source` and `verification` (`unverified` here);
+  reported and checked values are separate fields, never summed.
+- [x] Deterministic output: same inputs → byte-identical file.
+- [x] Backfill the available window into `data/rounds.jsonl` (53 rounds,
+  286–338, from the 2026-11-09T00:23Z snapshot).
+- [x] Tests with fixtures for the three input shapes, missing rounds, duplicate
   rounds, and float formatting.
-- **Evidence:** `pytest tests/test_ng_records.py -q` + `wc -l data/rounds.jsonl`
+- **Evidence:** `tests/test_ng_records.py` — 15 passed; `data/rounds.jsonl` —
+  53 lines; `data/summary.json` — top3 share 0.706396, HHI 0.186658,
+  33 zero-token entries. Commit `aeb100c`.
 
 ### P0.3 Held-out eval harness v0 — NG
 
