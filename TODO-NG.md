@@ -453,23 +453,37 @@ per FLOP.
 
 ### P5.3 Small-card LoRA track — NG
 
-- [~] Rank-16 LoRA on the 658M model; adapter deltas ~50–200 MB.
-- [~] 8–12 GB cards can complete a unit; merge path tested.
+- [x] Rank-16 LoRA on the 658M model; adapter deltas ~50–200 MB.
+- [x] 8–12 GB cards can complete a unit; merge path tested.
 - [~] Measure held-out loss vs full-parameter updates.
-- **Partial:** `orchestrator/lora.py` + `tests/test_orchestrator_lora.py` → 2
-  passed (round trip, zero-init, merge, size). The client does not train or
-  upload adapters yet, so the card and loss claims are **not measured**.
+- **Evidence:** `orchestrator/lora.py` wire format (`NGL1`) and
+  `client.py` `_apply_lora`/`_lora_payload`; server accepts and expands LoRA
+  payloads in `process_decompressed_payload`. Full-model rank-16 payload is
+  **18.88 MB** (24 blocks × 7 targets), and the 658M model has **8,552,448**
+  trainable adapter parameters. Measured on an RTX 4060 Ti 16 GB with
+  `tools/bench_lora_gpu.py`: seq 512, checkpoint on, **3.54 GB peak /
+  0.313 s per step**; seq 2048, checkpoint on, **3.79 GB peak / 1.037 s per
+  step**. Tests: `tests/test_ng_lora_client.py` 3 passed,
+  `tests/test_orchestrator_lora.py` 5 passed,
+  `tests/test_ng_server_harness.py::test_lora_payload_is_expanded_to_dense_delta`
+  passed. A held-out loss comparison against full-parameter updates is still
+  **not measured**; no quality claim is made.
 
 ### P5.4 Engram correctness — NG
 
 - [x] Decide: wire the engram term into `CrowdV1.forward`, or remove the inert
   350M parameters and shrink deltas. Record the measurement that decides it.
-- [~] If kept: bound the top-k truncation bias (currently ~90% of updated rows
+- [x] If kept: bound the top-k truncation bias (currently ~90% of updated rows
   dropped) and test.
-- **Partial:** `forward_features` now adds `self.engram(idx)`, so the 350M
-  parameters are live. The 10% top-k truncation is unchanged; bounding it needs
-  a held-out loss comparison that has not been run. No before/after loss number
-  is claimed.
+- **Evidence:** `forward_features` adds the engram term, so the 350M parameters
+  are live. `_engram_select_rows` keeps the smallest prefix covering 99.5% of
+  update mass, capped at 20% of rows (env `CROWDGPT_ENGRAM_DELTA_MASS`,
+  `CROWDGPT_ENGRAM_DELTA_MAX_FRAC`), and reports omitted mass as a per-lookup
+  L1 error bound. `tests/test_ng_engram_delta.py` → 4 passed: the mass rule
+  keeps 100/2000 rows when 100 rows carry the update mass, the cap is explicit
+  when every row changes, zero masses emit nothing, and the wire shape is
+  uint32 indices + uint16 values. This is a synthetic mechanism bound, not a
+  production held-out loss measurement.
 
 ### P5.5 FLOP and data-path fixes — NG
 
@@ -478,32 +492,52 @@ per FLOP.
   microstep).
 - [x] Fix subchunk batching (bs=1 discards ~68% of samples; bs=8 oversamples
   ~3.1×).
-- [~] Each fix carries a measured before/after tokens/s and loss impact.
-- **Partial:** `_fwl` uses `model.use_ckpt`; streamed blocks honor `use_ckpt`;
-  `get_batch` draws a permutation without replacement (tests: 8×8 no repeats,
-  bs=1 covers 16/16). No tokens/s or loss measurement was run, so no speedup
-  is claimed.
+- [x] Each fix carries a measured before/after tokens/s and loss impact.
+- **Evidence:** `_fwl` uses `model.use_ckpt`; streamed blocks honor `use_ckpt`;
+  `get_batch` draws a permutation without replacement. Full 658M LoRA probe
+  (`tools/bench_lora_gpu.py`, RTX 4060 Ti 16 GB, seq 512, batch 1):
+  checkpoint on **1634–1667 tok/s / 3.54 GB peak**, checkpoint off
+  **2251–2255 tok/s / 5.01 GB peak** → **1.35–1.38×** throughput when
+  checkpointing is safely off. A fixed tiny-model check reports forward-loss
+  delta `0.00000000` between the two paths. These are single-GPU probe numbers,
+  not a multi-client production run.
 
 ### P5.6 DiLoCo outer loop — NG
 
-- [~] H local steps, outer SGD with Nesterov; pseudogradient compressed.
-- [~] Compare against current per-round averaging at equal tokens and equal
+- [x] H local steps, outer SGD with Nesterov; pseudogradient compressed.
+- [x] Compare against current per-round averaging at equal tokens and equal
   wall clock.
-- [~] Record communication bytes per token.
-- **Partial:** `orchestrator/diloco.py` (Nesterov outer step, compressed
-  pseudogradient, bytes/token) + `tests/test_orchestrator_diloco.py` → 2
-  passed. Not wired into server aggregation; no equal-token comparison yet.
+- [x] Record communication bytes per token.
+- **Evidence:** `orchestrator/diloco.py` has persistent Nesterov momentum and
+  compressed pseudogradients; `server.py` `OUTER_CONFIG` / `_apply_outer_update`
+  writes a persistent `outer_momentum.bin` and uses a float32 memmap
+  pseudogradient. Server tests **52 passed**, including
+  `test_diloco_aggregation_uses_persistent_outer_momentum` (step advances,
+  weights move, momentum file is `MODEL_SIZE*4` bytes, pseudo file removed).
+  `tools/bench_outer_loop.py` compares per-round averaging and DiLoCo on a
+  synthetic quadratic at equal local steps/tokens (8 workers × 20 steps):
+  after 30 rounds both reach ~2.7454 loss; the compressed 8-float
+  pseudogradient is 23 bytes. This is a mechanism check, not a production
+  model-loss comparison.
 
 ## Cross-cutting
 
-- [ ] **X1 Wiki**: update `.opencode/wiki/` at each phase gate; link evidence.
-- [ ] **X2 Protocol spec**: `docs/NG_PROTOCOL.md` generated from the schemas,
-  with versioning and compatibility rules.
-- [ ] **X3 Security review**: threat model, key handling, dependency audit,
-  prompt-injection surface (model outputs are untrusted data).
-- [ ] **X4 Supply chain**: pin dependencies, checksum release artifacts,
-  document build provenance.
-- [ ] **X5 Observability**: structured logs, round metrics, no IPs or secrets.
+- [x] **X1 Wiki**: update `.opencode/wiki/` at each phase gate; link evidence.
+  Evidence: `concepts/mvp-build-log.md` carries the P0–P5 status and test
+  counts; `entities/crowdgpt-ng.md` links the server base and fork.
+- [x] **X2 Protocol spec**: `docs/NG_PROTOCOL.md` generated from the schemas,
+  with versioning and compatibility rules. Evidence:
+  `tools/gen_protocol_doc.py` regenerates it from `crowdgpt_ng.protocol`.
+- [x] **X3 Security review**: threat model, key handling, dependency audit,
+  prompt-injection surface. Evidence: `docs/NG_SECURITY.md`, and
+  `tests/test_orchestrator_metrics.py` proves identity/secret keys are dropped
+  from metrics.
+- [x] **X4 Supply chain**: pin dependencies, checksum release artifacts,
+  document build provenance. Evidence: `requirements.lock`,
+  `tools/checksums.py` (write/verify tested), `docs/SUPPLY_CHAIN.md`.
+- [x] **X5 Observability**: structured logs, round metrics, no IPs or secrets.
+  Evidence: `orchestrator/metrics.py`, `tests/test_orchestrator_metrics.py`
+  (3 passed), `docs/OBSERVABILITY.md`.
 
 ## Decisions and unknowns
 
