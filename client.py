@@ -497,7 +497,7 @@ def _load_or_create_device_id() -> str:
     return new_id
 
 DEVICE_ID = _load_or_create_device_id()
-log.info(f"[device] id={DEVICE_ID[:8]}… ({DEVICE_ID_FILE.name})")
+log.debug(f"[device] id={DEVICE_ID[:8]}… ({DEVICE_ID_FILE.name})")
 
 MAX_CACHED_REVISIONS = 1; MAX_HF_CACHE_GB = 6.0; STALE_PART_AGE_SEC = 60 * 60; STALE_BAK_AGE_SEC = 24 * 60 * 60
 # A half-open download must not stall a training round for an hour. The
@@ -3026,7 +3026,7 @@ def run_single_round_wrapper(srv, at, se, emit):
         timing.finish(ok=False, error="no_round")
         return
     cr = rs["current_round"]; timing.set_round(cr)
-    _unit_started_iso = datetime.now(timezone.utc).isoformat()
+    _unit_started_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
     timing.phase("queue", time.monotonic() - round_started)
     hb = HeartbeatManager(srv, h, cr, se, emit); hb.start()
     model = ob = oe = x = y = lo = iw = ie = iew = ds = None
@@ -3308,7 +3308,7 @@ def run_single_round_wrapper(srv, at, se, emit):
             if _key and _ticket.get("ticketId"):
                 import secrets as _secrets
                 _base = hashlib.sha256(str(_ticket.get("baseWeights") or "").encode()).hexdigest()
-                _now = datetime.now(timezone.utc).isoformat()
+                _now = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 _receipt = {"schema": "ng-1", "ticket_id": _ticket["ticketId"],
                             "round": int(cr), "client_id": DEVICE_ID or "anonymous",
                             "base_weights": _base, "tokens": int(tt), "steps": int(micro_step),

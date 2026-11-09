@@ -134,3 +134,22 @@ def test_orchestrator_failover_urls(client_module, monkeypatch):
     assert urls == ["https://a.example", "https://b.example", "https://c.example"]
     assert client_module._failover_url("https://a.example/fl/submit", urls) == "https://b.example/fl/submit"
     assert client_module._failover_url("https://c.example/fl/submit", urls) == "https://a.example/fl/submit"
+
+
+def test_dataset_batches_do_not_repeat_samples(client_module):
+    torch = pytest.importorskip("torch")
+    ds = object.__new__(client_module.StreamingShardDataset)
+    ds.data = __import__("numpy").arange(64 * 65, dtype="uint32")
+    ds.n = 64; ds.tps = 65; ds.steps_used = 0; ds._order = None; ds._pos = 0
+    ds.cohort_mode = False; ds.advance = lambda *a, **k: True
+    seen = []
+    for i in range(8):
+        x, _ = ds.get_batch(8, seed=1)
+        seen.extend(int(v[0]) for v in x)
+    assert len(seen) == len(set(seen)) == 64
+    ds2 = object.__new__(client_module.StreamingShardDataset)
+    ds2.data = __import__("numpy").arange(16 * 65, dtype="uint32")
+    ds2.n = 16; ds2.tps = 65; ds2.steps_used = 0; ds2._order = None; ds2._pos = 0
+    ds2.cohort_mode = False; ds2.advance = lambda *a, **k: True
+    seen2 = [int(ds2.get_batch(1, seed=2)[0][0][0]) for _ in range(16)]
+    assert len(set(seen2)) == 16
