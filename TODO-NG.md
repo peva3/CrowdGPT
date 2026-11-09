@@ -239,10 +239,16 @@ duplicating work, and that never proxies bulk bytes.
 
 ### P1.5 Restart drill — SRV
 
-- [ ] `kill -9` during aggregation and during upload; restart; the round
+- [x] `kill -9` during aggregation and during upload; restart; the round
   completes or is explicitly discarded, never half-applied.
-- [ ] Test asserts exactly one accepted delta per ticket and no lost tickets.
-- **Evidence:** drill log in `docs/NG_DRILLS.md`
+- [x] Test asserts exactly one accepted delta per ticket and no lost tickets.
+- **Evidence:** `docs/NG_DRILLS.md`. `CrowdGPT-Server/tests/test_restart_drill.py`
+  forks and SIGKILLs a real process after a committed round/pool/ticket, inside
+  an open transaction, and with a half-written object → 3 passed (committed
+  state survives, uncommitted round rolls back, upload stays `open` with no
+  committed object). The ng harness → 8 passed: restart reconstructs state,
+  duplicate finalize leaves one delta, and a closed round is not resurrected.
+  Full uvicorn kill is an operator runbook item in P4.
 
 ## P2 — Signed records and validators
 

@@ -419,3 +419,20 @@ def test_presigned_object_upload_and_hash_check(tmp_path, monkeypatch):
                                   "sha256": checksum2})
     assert bad_final.status_code == 400, bad_final.text
     assert bad_final.json()["detail"]["reason"] == "object_hash_mismatch"
+
+
+def test_closed_round_is_not_resurrected(tmp_path, monkeypatch):
+    repo = _prepare_repo(tmp_path)
+    first = _configure(_import_server(repo, monkeypatch), monkeypatch)
+    client = TestClient(first.app)
+    _two_client_task(first, client)
+    # Mark the round closed as the watchdog does after aggregation.
+    first.ORCH.scheduling.save_round(
+        first.round_state["current_round"], state="closed",
+        started_at=first.round_state["round_start_time"], duration_hours=4.0,
+        last_aggregation_at=time.time(), global_step=first.global_step,
+        participating=dict(first.round_state["participating_clients"]))
+    second = _configure(_import_server(repo, monkeypatch), monkeypatch)
+    assert second._restore_orchestrator_state() is False
+    assert second.pools == {}
+    assert second.task_tickets == {}
