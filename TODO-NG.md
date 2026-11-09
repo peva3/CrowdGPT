@@ -201,13 +201,23 @@ duplicating work, and that never proxies bulk bytes.
 
 ### P1.3 Presigned data plane — SRV/NG
 
-- [ ] Upload URLs issued by the orchestrator, bytes go to object storage (or
+- [x] Upload URLs issued by the orchestrator, bytes go to object storage (or
   HF), SHA-256 verified on finalize.
-- [ ] Client verifies downloaded weights against `base_weights` before
+- [x] Client verifies downloaded weights against `base_weights` before
   training.
-- [ ] Orchestration request/response bytes measured per round.
-- [ ] Tests: bad hash rejected; expired URL rejected; orchestrator sees no bulk
+- [x] Orchestration request/response bytes measured per round.
+- [x] Tests: bad hash rejected; expired URL rejected; orchestrator sees no bulk
   payload.
+- **Evidence:** `orchestrator/objects.py` (HMAC grant over key/expiry/sha256;
+  atomic `commit_file`; dev `LocalObjectStore`), `/fl/submit/init` returns an
+  `object` grant, `PUT /fl/object/{key}` verifies token and hash, `finalize`
+  accepts `{objectKey, sha256}` and re-hashes before processing. HF metadata
+  carries LFS SHA-256; the client verifies fresh downloads and deletes the file
+  on mismatch. `CONTROL_PLANE` counters exclude object PUTs and are exposed in
+  `/fl/round_status`. Server tests 10 passed; ng harness 7 passed (bad/expired
+  grant `403`, tampered object `400 object_hash_mismatch`, object PUT does not
+  increment control-plane requests). Server commit local; ng client change in
+  this commit.
 
 ### P1.4 Client cache, resume, prefetch — NG
 

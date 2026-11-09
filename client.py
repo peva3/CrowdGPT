@@ -2372,11 +2372,19 @@ def fetch_weights_from_hf(md, se, emit):
         path = _weight_blob_path(role, cid, size, revision)
         cached = path.exists() and ((size is not None and path.stat().st_size == int(size)) or (size is None and path.stat().st_size > 10_000_000))
         jobs.append((role, url, path, size, label, cached, cid))
+    expected_sha = {"model": model_info.get("sha256"), "engram": engram_info.get("sha256")}
     need = [j for j in jobs if not j[5]]
     if need:
         emit("status", "downloading"); emit("overlay_show", {"title_key": "dl_weights", "indeterminate": False})
         for role, url, path, size, label, cached, cid in need:
             _download_file_with_progress(url, path, emit, se, expected_size=size, label=label)
+            want = expected_sha.get(role)
+            if want:
+                got = _sha256_file(path)
+                if got != str(want).lower():
+                    try: path.unlink()
+                    except OSError: pass
+                    raise RuntimeError(f"{label} SHA-256 mismatch: expected {want}, got {got}")
     for role, url, path, size, label, cached, cid in jobs:
         if cached:
             emit("log", f"♻️ {label} unchanged on Hugging Face ({(cid or 'rev ' + str(revision))[:10]}…): using cached copy, no download")

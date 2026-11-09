@@ -362,3 +362,60 @@ def test_finalize_replays_after_restart(tmp_path, monkeypatch):
         "/fl/submit/finalize", headers=_headers("10.0.0.1"), json={"uploadId": upload_id})
     assert replay.status_code == 200, replay.text
     assert replay.json() == original.json()
+
+
+def test_presigned_object_upload_and_hash_check(tmp_path, monkeypatch):
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    client = TestClient(module.app)
+    task = _two_client_task(module, client)
+    payload = _delta_body(task["taskId"], module.MODEL_SIZE)
+    checksum = hashlib.sha256(payload).hexdigest()
+    init = client.post("/fl/submit/init", headers=_headers("10.0.0.1"), json={
+        "taskId": task["taskId"], "totalBytes": len(payload),
+        "chunkSize": len(payload), "chunks": 1, "checksum": checksum,
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 2.5, "localSteps": 1, "tokensProcessed": 1234,
+    })
+    assert init.status_code == 200, init.text
+    body = init.json()
+    assert len(init.content) < 2048, "init response must stay control-plane sized"
+    grant = body["object"]
+    assert grant["method"] == "PUT" and grant["sha256"] == checksum
+
+    # A tampered signature is rejected before any bytes are stored.
+    bad = grant["url"].replace("sig=", "sig=0")
+    assert client.put(bad, content=payload).status_code == 403
+    # An expired grant is rejected.
+    expired = grant["url"].replace("exp=", "exp=1")
+    assert client.put(expired, content=payload).status_code == 403
+    # The signed URL accepts exactly the advertised bytes.
+    before = dict(module.CONTROL_PLANE)
+    put = client.put(grant["url"], content=payload)
+    assert put.status_code == 200, put.text
+    assert put.json()["sha256"] == checksum
+    assert module.CONTROL_PLANE["requests"] == before["requests"], "object PUT must bypass the control plane"
+
+    final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                        json={"uploadId": body["uploadId"], "objectKey": grant["key"],
+                              "sha256": checksum})
+    assert final.status_code == 200, final.text
+    assert final.json()["status"] == "success"
+    assert len(list(module.pools.values())[0]["deltas"]) == 1
+
+    # A stored object whose content does not match the expected hash is refused.
+    task2 = _two_client_task(module, client)
+    payload2 = _delta_body(task2["taskId"], module.MODEL_SIZE)
+    checksum2 = hashlib.sha256(payload2).hexdigest()
+    init2 = client.post("/fl/submit/init", headers=_headers("10.0.0.1"), json={
+        "taskId": task2["taskId"], "totalBytes": len(payload2),
+        "chunkSize": len(payload2), "chunks": 1, "checksum": checksum2,
+        "weightFormat": "bf16", "hasEngram": False, "engramSparseCount": 0,
+        "loss": 2.5, "localSteps": 1, "tokensProcessed": 1234,
+    }).json()
+    grant2 = init2["object"]
+    module.OBJECT_STORE.put(grant2["key"], b"not the delta")
+    bad_final = client.post("/fl/submit/finalize", headers=_headers("10.0.0.1"),
+                            json={"uploadId": init2["uploadId"], "objectKey": grant2["key"],
+                                  "sha256": checksum2})
+    assert bad_final.status_code == 400, bad_final.text
+    assert bad_final.json()["detail"]["reason"] == "object_hash_mismatch"
