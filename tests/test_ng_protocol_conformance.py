@@ -50,3 +50,21 @@ def test_signature_is_verifiable_by_the_other_module():
                               "signer": signer, "pubkey": key.public_key_hex,
                               "sig": sig})
     assert back == payload
+
+
+def test_client_verifies_server_round_certificate():
+    from orchestrator.identity import NodeIdentity
+    from orchestrator.records import ZERO_ROOT, build_round_record, sign_record
+
+    key = NodeIdentity.generate()
+    record = build_round_record(
+        round_no=5, opened_at="2026-11-09T00:00:00Z", closed_at="2026-11-09T01:00:00Z",
+        base_weights="a" * 64, aggregate_weights="b" * 64,
+        leader="node-" + key.public_key_hex[:16], witnesses=(),
+        tickets_root="1" * 64, submissions_root="2" * 64, deltas_root="3" * 64,
+        prev_record_hash=ZERO_ROOT, eval=None, bytes_down=1, bytes_up=2,
+        code_versions=("3.2",))
+    signed = sign_record(record, key, record["leader"])
+    assert ng.verify_round_certificate(signed, signed["certificate"][0]) is True
+    tampered = dict(signed); tampered["bytes"] = {"down": 9, "up": 9}
+    assert ng.verify_round_certificate(tampered, signed["certificate"][0]) is False

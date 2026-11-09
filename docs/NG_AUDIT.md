@@ -33,7 +33,9 @@ fingerprint when `CROWDGPT_FINGERPRINT=1` and puts the root in its receipt.
 ## Audit log
 
 `/api/audit/rounds`, `/api/audit/checkpoint`, `/api/audit/proof`, and
-`/api/audit/chain` expose the append-only publications. `/audit` is a small
+`/api/audit/chain` expose the append-only publications. A client can verify a
+published record with `crowdgpt_ng.protocol.verify_round_certificate` and a
+leaf with `verify_merkle_proof`; neither requires the server package. `/audit` is a small
 HTML page over those endpoints. `public_rounds.jsonl` is copied into the HF
 upload folder as `rounds.jsonl`; `CROWDGPT_AUDIT_MIRROR` copies it to an
 independent path.
