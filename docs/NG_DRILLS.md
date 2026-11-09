@@ -66,3 +66,59 @@ while a **client** waits is covered separately by the client failover tests
 (P6.4), not by this runner.
 
 Evidence artifact: `/tmp/ng-sim/report.json` from the run above.
+
+## P7 packaging and peer-routing readiness
+
+### Aggregation memory floor
+
+`CrowdGPT-Server/tools/bench_aggregation_memory.py` allocates the real
+657,787,392-param base and 350,000,640-param engram as float32 masters, then
+applies one 10M-parameter delta chunk.
+
+Observed on this machine (2026-11-09):
+
+| Measure | Value |
+|---|---|
+| Master bytes | 4,031,152,128 (4.03 GB) |
+| Allocation time | 0.236 s |
+| Peak RSS after allocation | 4.12 GB |
+| Apply time for all chunks | 0.619 s |
+| Peak RSS after apply | 4.16 GB |
+
+The old 2 vCPU / 4 GB operator minimum is therefore too low. Use at least
+8 GB RAM for aggregation; 16 GB is comfortable. This probe does not include
+file streaming, merge buffers, or the HTTP server's own footprint.
+
+### Static-peer routing and handoff
+
+`tests/test_orchestrator_peer_service.py` → 6 passed:
+
+- A-issued signed ticket and task replicate to B; B can consume the ticket.
+- Replaying the same ticket does not create a second row or reset consumption.
+- A conflicting local ticket is not overwritten by a peer.
+- Reused nonces and stale timestamps are rejected.
+- Submission content hashes are recorded once.
+- A lease requires the peer acknowledgement and the registry announcement reaches
+  the peer.
+
+`Crowdgpt-ng/tests/test_ng_server_harness.py` exercises the production
+`/cluster/*` routes in-process: ticket/task, round snapshot, submission,
+signed registry, witness signature, and `/operator` page.
+
+### Multi-process drill
+
+`CrowdGPT-Server/tools/sim_cluster.py` was rerun after the P7 changes. It is
+still a **single-machine simulation**, not a production RTO:
+
+| Drill | Result |
+|---|---|
+| Registry convergence | 3/3 |
+| Leader killed ×3 | takeover each time; RTO 3.022 / 3.021 / 3.056 s |
+| Duplicate finalize | exactly once, counts [1,1,1] |
+| Restart under 40 writes | 41 before, 41 after, 41 after replay; no loss/duplicates |
+| 2–2 partition, global quorum 3 | neither side certified |
+| 2-of-3 witness certificates | 2 accepted; 1 rejected `quorum not met: 1/2` |
+
+The production `server.py` peer routes and the lab `sim_node.py` are separate
+processes; the full training path is not run across three 658M-model nodes on
+this machine. The simulation proves the control-plane mechanics only.

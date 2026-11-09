@@ -843,3 +843,66 @@ def test_ngd1_delta_is_decoded_to_dense_bf16(tmp_path, monkeypatch):
                                  dtype=torch.uint16).view(torch.bfloat16).float()
     assert meta["deltaCodec"] == "ngd1"
     assert float(dense[0]) > 0.0
+
+
+def test_peer_routes_accept_signed_ticket_round_and_submission(tmp_path, monkeypatch):
+    sys.path.insert(0, str(SERVER_DIR))
+    from orchestrator.admission import AdmissionService
+    from orchestrator.identity import NodeIdentity
+    from orchestrator.nodes import local_node_record, node_id_for
+    from orchestrator.peer_service import PeerService
+    from orchestrator.replication import PeerConfig
+    from orchestrator.records import build_round_record, canonical_json, sign_record
+    from orchestrator.state import StateStore
+
+    module = _configure(_import_server(_prepare_repo(tmp_path), monkeypatch), monkeypatch)
+    peer_key = NodeIdentity.generate()
+    module.PEER = PeerService(
+        module.ORCH.store, module.ORCH.identity,
+        PeerConfig(module.NODE_ID or "node-test", "http://self", (), quorum=1),
+        admission=module.ORCH.admission)
+    client = TestClient(module.app)
+
+    assert client.get("/cluster/health").json()["configured"] is True
+    page = client.get("/operator")
+    assert page.status_code == 200 and "CrowdGPT operator" in page.text
+
+    peer_store = StateStore(tmp_path / "peer.sqlite3")
+    peer_admission = AdmissionService(peer_store, identity=peer_key)
+    ticket = peer_admission.issue("ip:10.0.0.9", "round_9_p9", 9, pool_id="p9")
+    body = module.PEER.auth.wrap({"ticket": ticket.__dict__, "task": {
+        "taskId": "round_9_p9", "round": 9, "poolId": "p9",
+        "poolSnapshot": {"pool_id": "p9", "round": 9, "clients": ["ip:10.0.0.9"],
+                         "hardware_sig": [], "status": "training"}}})
+    reply = client.post("/cluster/ticket/announce", json=body)
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["ok"] is True
+    assert module.ORCH.admission.get("ip:10.0.0.9").ticket_id == ticket.ticket_id
+
+    round_snapshot = module.PEER.auth.wrap({"round": {"round": 9, "state": "open"}})
+    assert client.post("/cluster/round/announce", json=round_snapshot).json()["ok"] is True
+    sub = module.PEER.auth.wrap({"contentSha256": "d" * 64, "round": 9,
+                                 "clientKey": "ip:10.0.0.9"})
+    assert client.post("/cluster/submission/announce", json=sub).json()["created"] is True
+
+    record = local_node_record(peer_key, endpoints=["https://peer.example"],
+                               roles=["leader"], software_version="3.2",
+                               started_at="2026-11-09T00:00:00Z")
+    rec = module.PEER.auth.wrap({"record": record,
+                                 "signature": peer_key.sign(canonical_json(record).encode())})
+    assert client.post("/cluster/registry/announce", json=rec).json()["ok"] is True
+
+    round_record = sign_record(
+        build_round_record(round_no=9, opened_at="2026-11-09T00:00:00Z",
+                           closed_at="2026-11-09T01:00:00Z", base_weights="a" * 64,
+                           aggregate_weights="b" * 64, leader=node_id_for(peer_key),
+                           witnesses=(), tickets_root="1" * 64,
+                           submissions_root="2" * 64, deltas_root="3" * 64,
+                           prev_record_hash=None, eval=None, bytes_down=1,
+                           bytes_up=2, code_versions=("3.2",)),
+        peer_key, node_id_for(peer_key))
+    witness = module.PEER.auth.wrap({"record": round_record})
+    signed = client.post("/cluster/witness/sign", json=witness)
+    assert signed.status_code == 200, signed.text
+    assert signed.json()["node"] == (module.NODE_ID or "node-test")
+    peer_store.close()
