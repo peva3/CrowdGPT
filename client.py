@@ -381,6 +381,9 @@ DEVICE_ID = _load_or_create_device_id()
 log.info(f"[device] id={DEVICE_ID[:8]}… ({DEVICE_ID_FILE.name})")
 
 MAX_CACHED_REVISIONS = 1; MAX_HF_CACHE_GB = 6.0; STALE_PART_AGE_SEC = 60 * 60; STALE_BAK_AGE_SEC = 24 * 60 * 60
+# A half-open download must not stall a training round for an hour. The
+# existing .part/Range resume path handles the retry after a short timeout.
+STREAM_CONNECT_TIMEOUT = 15; STREAM_READ_TIMEOUT = 120
 
 def _dir_size_bytes(path: Path) -> int:
     total = 0
@@ -1052,6 +1055,21 @@ def estimate_vram_bytes(bs, sl, u8):
     workspace = int(ALLOCATOR_RESERVE_GB * 1024**3)
     return int(head_bytes + block_bytes + act + loss + workspace)
 
+def _checkpoint_extra_bytes(bs, sl):
+    """Extra activation memory if checkpointing is disabled.
+
+    Checkpointing retains one block input per layer plus one layer's transient
+    working set. Without it every layer's working set stays live until backward.
+    The loss term is not included because `_chunk_ce` remains checkpointed.
+    """
+    per_layer = bs * sl * (DIM * 12 + MLP_HIDDEN * 3) * 4
+    return max(0, (N_LAYERS - 1) * per_layer)
+
+def _can_disable_checkpoint(bs, sl, u8, budget_gb, margin=1.25):
+    budget = int(max(0.0, float(budget_gb)) * 1024 ** 3)
+    spare = budget - estimate_vram_bytes(bs, sl, u8)
+    return spare > margin * _checkpoint_extra_bytes(bs, sl)
+
 def recommend_batch_size(sl=MAX_SEQ_LEN, force_mode=None):
     """force_mode: None = native (8bit if available, else 32); "adamw8bit" = force 8bit (2 bytes/param);
     "adamw32" = force fp32 (8 bytes/param). Forcing matters because 8bit<->fp32 changes the VRAM
@@ -1649,12 +1667,22 @@ class EngramMemory(nn.Module):
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 
-def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+def _streamed_block_params(block, dev, dtype):
     if dtype is not None:
-        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+        return {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+    return {n: p.to(dev) for n, p in block.named_parameters()}
+
+def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+    params = _streamed_block_params(block, dev, dtype)
+    if dtype is not None:
         with torch.autocast(device_type=dev.type, dtype=dtype):
             return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
-    params = {n: p.to(dev) for n, p in block.named_parameters()}
+    return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
+
+def _streamed_block_cached(block, params, dev, dtype, x, cos, sin, use_chunked):
+    if dtype is not None:
+        with torch.autocast(device_type=dev.type, dtype=dtype):
+            return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
     return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
 
 class SotaGPT(nn.Module):
@@ -1674,7 +1702,19 @@ class SotaGPT(nn.Module):
             head_gpu = int(gpu_layers) >= N_LAYERS; self.loss_chunk_hint = LOSS_CHUNK
         self.gpu_layers = 0 if is_cpu else max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
-        self.head_on_gpu = bool(head_gpu) and not is_cpu and not force_head_cpu
+        self.head_on_gpu = bool(head_gpu) and not is_cpu
+        # Caching streamed parameter copies removes the duplicate H2D copy that
+        # checkpoint recompute would otherwise repeat. It costs ~849 MB on the
+        # default model, so only do it when the budget leaves real headroom.
+        self.cache_streamed_params = False
+        if not is_cpu and self.gpu_layers < N_LAYERS:
+            try:
+                _u8 = u8_override if u8_override is not None else (
+                    has_bitsandbytes() and device is not None and device.type in ('cuda', 'rocm'))
+                spare = memory_config["ram_gb"] * 1024 ** 3 - estimate_vram_bytes(bs, sl, _u8)
+                self.cache_streamed_params = spare > 2.5 * 1024 ** 3
+            except Exception:
+                self.cache_streamed_params = False
         self.wte = nn.Embedding(VOCAB_SIZE, DIM); self.engram = EngramMemory(bn, device)
         self.blocks = nn.ModuleList([Block() for _ in range(N_LAYERS)])
         self.ln_f = nn.LayerNorm(DIM); self.lm_head = nn.Linear(DIM, VOCAB_SIZE, bias=False)
@@ -1730,7 +1770,11 @@ class SotaGPT(nn.Module):
                 if use_ckpt: x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
                 else: x = block(x, cos, sin, use_chunked)
             else:
-                x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                if getattr(self, 'cache_streamed_params', False):
+                    params = _streamed_block_params(block, dev, stream_dtype)
+                    x = checkpoint(_streamed_block_cached, block, params, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                else:
+                    x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True): return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
@@ -1865,7 +1909,7 @@ def _register_error_code(r):
 
 def do_register(srv, u, email, p):
     try:
-        r = requests.post(f"{srv}/auth/register", json={"username": u, "password": p, "email": email}, timeout=30)
+        r = requests.post(f"{srv}/auth/register", json={"username": u, "password": p, "emaiclient.pyl": email}, timeout=30)
         if r.status_code == 200:
             try:
                 tok = r.json().get("token")
@@ -2102,7 +2146,7 @@ def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, 
             os.replace(tmp, dest); return dest
         try:
             hdrs = {"Range": f"bytes={done}-"} if done > 0 else {}
-            r = requests.get(url, headers=hdrs, stream=True, timeout=(15, 3600), allow_redirects=True)
+            r = requests.get(url, headers=hdrs, stream=True, timeout=(STREAM_CONNECT_TIMEOUT, STREAM_READ_TIMEOUT), allow_redirects=True)
             if r.status_code == 416:
                 if expected is not None and done >= expected:
                     os.replace(tmp, dest); return dest
@@ -2152,7 +2196,7 @@ def fetch_task(srv, h, prec, se, emit, hb=None):
             emit('status', 'downloading')
             emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
             req_headers = {**(h or {}), **_hardware_headers()}
-            r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(15, 3600), stream=True)
+            r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(STREAM_CONNECT_TIMEOUT, STREAM_READ_TIMEOUT), stream=True)
             if r.status_code == 401:
                 r.close()
                 emit('log', "⚠️ auth rejected (401) — clearing the saved session")
@@ -2186,25 +2230,26 @@ def fetch_task(srv, h, prec, se, emit, hb=None):
                 continue
             cl_total = int(r.headers.get('content-length', 0) or 0)
             total = cl_total if cl_total > 0 else EXPECTED_WEIGHT_BYTES
-            chunks = []; done = 0; last = 0.0
+            # One buffer, no list + join + full-payload slice: the inline
+            # payload is ~1.9 GiB, and the old path held two copies at once.
+            buf = bytearray(); done = 0; last = 0.0
             for chunk in r.iter_content(chunk_size=512 * 1024):
                 if not chunk: continue
                 if se.is_set() or (hb and hb.should_stop()):
                     r.close()
                     raise KeyboardInterrupt("Stop requested")
-                chunks.append(chunk); done += len(chunk)
+                buf.extend(chunk); done += len(chunk)
                 now = time.time()
                 if now - last > 0.25:
                     emit('overlay_progress', {'done': done, 'total': total}); last = now
             r.close()
             emit('overlay_progress', {'done': done, 'total': total}); emit('overlay_hide', {}); emit('status', 'preparing')
-            raw = b"".join(chunks); del chunks
-            if len(raw) < 4:
-                emit('log', f"/fl/task returned only {len(raw)} bytes; retrying"); time.sleep(5); continue
-            ml = struct.unpack('<I', raw[:4])[0]
-            if 4 + ml > len(raw):
+            if len(buf) < 4:
+                emit('log', f"/fl/task returned only {len(buf)} bytes; retrying"); time.sleep(5); continue
+            ml = struct.unpack('<I', buf[:4])[0]
+            if 4 + ml > len(buf):
                 emit('log', f"Truncated header; retrying"); time.sleep(5); continue
-            md = json.loads(raw[4:4 + ml].decode()); wb = raw[4 + ml:]
+            md = json.loads(bytes(buf[4:4 + ml]).decode()); wb = memoryview(buf)[4 + ml:]
             emit('log', f"/fl/task inline: metadata OK, weights={len(wb):,} bytes")
             if len(wb) < EXPECTED_WEIGHT_BYTES:
                 emit('log', f"⚠️ inline truncated at {len(wb):,}; retrying"); time.sleep(10); continue
@@ -2301,7 +2346,7 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
     sd = ad if ua else None; nc = max(1, math.ceil(sl / loss_chunk))
     def compute():
         w = m.head_weight(sd)
-        xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd, head_w=w)
+        xe = m.forward_features(x, use_chunked=True, use_ckpt=bool(getattr(m, 'use_ckpt', True)), stream_dtype=sd, head_w=w)
         y_dev = y.to(xe.device)
         lo = sum(checkpoint(_chunk_ce, xe[:, i:i + loss_chunk, :], w, y_dev[:, i:i + loss_chunk], use_reentrant=False, preserve_rng_state=False) for i in range(0, sl, loss_chunk)) / nc
         return lo, xe, w
@@ -2338,6 +2383,10 @@ def _clear_accel_cache(device):
         elif device is not None and device.type == 'xpu': torch.xpu.empty_cache()
     except Exception: pass
     gc.collect()
+
+def _oom_rung_changes_placement(stage):
+    """Rungs 4/5 only shrink the loss chunk; rebuilding Adam would lose its moments."""
+    return int(stage) not in (4, 5)
 
 class DegradeLadder:
     def __init__(self, model, on_step_down=None):
@@ -2386,6 +2435,13 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
         except RuntimeError as e:
             if not _is_oom(e): raise
             emit('log', f"💥 OOM detected: {str(e).splitlines()[0]}"); _clear_accel_cache(model.accel_device)
+            # Checkpointing is the cheapest rung: restore it before giving up GPU
+            # residency or lowering the batch size.
+            if not getattr(model, 'use_ckpt', True):
+                model.use_ckpt = True
+                for p in model.parameters(): p.grad = None
+                emit('log', "   re-enabled activation checkpointing; retrying same batch")
+                continue
             # A backward that died mid-flight can leave partially written grads. Drop every
             # parameter's grad (including sparse engram rows) before retrying; optimizers keep
             # their Adam moments, so no rebuild is needed. This also discards grads accumulated
@@ -2578,6 +2634,9 @@ def _parse_task_meta(md, emit):
 # ---- v3.1: background uploader (max 1 upload in flight; training continues meanwhile) ----
 _upload_lock = threading.Lock()
 _upload_thread = None
+# Uploads are aborted only on a real hard shutdown, never by pause/Stop: a
+# paused training loop must not kill a POST that already owns a finished round.
+_UPLOAD_ABORT = threading.Event()
 
 def _upload_active():
     t = _upload_thread
@@ -2587,7 +2646,9 @@ def _wait_for_upload(se, emit=None, poll=0.5, hb=None):
     """Block until the in-flight upload (if any) finishes. Returns False if stopped (or refused, via hb) first."""
     announced = False
     while _upload_active():
-        if se.is_set() or (hb is not None and hb.rejected is not None): return False
+        # A training pause/Stop must not cancel an upload; only a coordinator
+        # refusal makes this round's delta not worth writing.
+        if hb is not None and hb.rejected is not None: return False
         if emit is not None and not announced:
             emit('log', "⏳ Previous upload still in progress; this round's delta will upload right after it."); emit('status', 'waiting'); announced = True
         time.sleep(poll)
@@ -2612,7 +2673,7 @@ def _submit_delta_background(srv, h, delta_path, delta_size, meta, emit, se, hb=
         return
     with _upload_lock:
         def _run():
-            try: _upload_delta_file(srv, h, delta_path, delta_size, meta, _bg_emit(emit), se)
+            try: _upload_delta_file(srv, h, delta_path, delta_size, meta, _bg_emit(emit), _UPLOAD_ABORT)
             except BaseException as e:
                 try: emit('log', f"Upload failed: {e}")
                 except Exception: pass
@@ -2807,6 +2868,9 @@ def run_single_round_wrapper(srv, at, se, emit):
             nonlocal ob, oe
             if cohort_mode and _ladder.stage >= 6:
                 raise CohortAbort("OOM: would require CPU-only fallback in cohort mode")
+            if not _oom_rung_changes_placement(_ladder.stage):
+                emit('log', "   reduced loss chunk; keeping optimizer state")
+                return
             # Preserve optim_mode: flipping back to native mid-round would submit a delta trained
             # with the wrong optimizer for the pool, silently failing cross-check
             ob, oe = _build_optimizers(model, lr=1e-4, force_mode=optim_mode); emit('log', "   rebuilt optimizers for new placement")
