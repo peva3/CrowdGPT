@@ -441,6 +441,9 @@ DEVICE_ID = _load_or_create_device_id()
 log.info(f"[device] id={DEVICE_ID[:8]}… ({DEVICE_ID_FILE.name})")
 
 MAX_CACHED_REVISIONS = 1; MAX_HF_CACHE_GB = 6.0; STALE_PART_AGE_SEC = 60 * 60; STALE_BAK_AGE_SEC = 24 * 60 * 60
+# A half-open download must not stall a training round for an hour. The
+# existing .part/Range resume path handles the retry after a short timeout.
+STREAM_CONNECT_TIMEOUT = 15; STREAM_READ_TIMEOUT = 120
 
 def _dir_size_bytes(path: Path) -> int:
     total = 0
@@ -539,6 +542,9 @@ ENGRAM_ACTIVE = os.environ.get("CROWDGPT_ENGRAM", "1") == "1"
 
 LOSS_CHUNK = 256; UPLOAD_BUFFER_MIN = 25; ALLOWED_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128]
 SAFETY_MARGIN_GB = 1.0; ALLOCATOR_RESERVE_GB = 0.5; MIN_HEADROOM_GB = 0.25
+# The planner's byte estimate is tight enough that a 512 MiB allocation can
+# still fail on a 12 GB card. Keep a full gigabyte out of placement decisions.
+PLACEMENT_SAFETY_GB = 1.0
 CAL_TIME_BUDGET = 90.0; CAL_MIN_MICRO = 3; CAL_MAX_MICRO_HARD = 20
 
 def _calc_model_size():
@@ -1109,6 +1115,21 @@ def estimate_vram_bytes(bs, sl, u8):
     workspace = int(ALLOCATOR_RESERVE_GB * 1024**3)
     return int(head_bytes + block_bytes + act + loss + workspace)
 
+def _checkpoint_extra_bytes(bs, sl):
+    """Extra activation memory if checkpointing is disabled.
+
+    Checkpointing retains one block input per layer plus one layer's transient
+    working set. Without it every layer's working set stays live until backward.
+    The loss term is not included because `_chunk_ce` remains checkpointed.
+    """
+    per_layer = bs * sl * (DIM * 12 + MLP_HIDDEN * 3) * 4
+    return max(0, (N_LAYERS - 1) * per_layer)
+
+def _can_disable_checkpoint(bs, sl, u8, budget_gb, margin=1.25):
+    budget = int(max(0.0, float(budget_gb)) * 1024 ** 3)
+    spare = budget - estimate_vram_bytes(bs, sl, u8)
+    return spare > margin * _checkpoint_extra_bytes(bs, sl)
+
 def recommend_batch_size(sl=MAX_SEQ_LEN, force_mode=None):
     """force_mode: None = native (8bit if available, else 32); "adamw8bit" = force 8bit (2 bytes/param);
     "adamw32" = force fp32 (8 bytes/param). Forcing matters because 8bit<->fp32 changes the VRAM
@@ -1484,7 +1505,7 @@ def _doctor_collect_report(args):
     if session["present"]:
         _doctor_add(checks, "Session", "saved", "ok", f"{session['username'] or 'unknown user'} on {session['server'] or 'unknown server'}")
     else:
-        _doctor_add(checks, "Session", "saved", "info", session["error"] or "no saved session; use --register or --user/--password")
+        _doctor_add(checks, "Session", "saved", "info", session["error"] or "no saved session; use --login, --register or --user/--password")
 
     update = _doctor_update_probe()
     if not update["checked"]:
@@ -1568,6 +1589,13 @@ def run_doctor(args):
         print(_doctor_render_text(report))
     return 0 if report["summary"]["fail"] == 0 else 1
 
+def _placement_budget_gb():
+    return max(0.25, float(memory_config["ram_gb"]) - PLACEMENT_SAFETY_GB)
+
+def _cohort_predegrade(cc_bs, bs_est):
+    try: return bool(cc_bs and int(cc_bs) > int(bs_est))
+    except (TypeError, ValueError): return False
+
 def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
                     u8=False, loss_chunk=LOSS_CHUNK, act_bytes=None):
     if backend_name == "ROCM": loss_chunk = min(loss_chunk, 128)
@@ -1585,7 +1613,13 @@ def _plan_placement(device, backend_name, budget_gb, bs=1, sl=MAX_SEQ_LEN,
     fixed = fixed_cost(lc); remaining = budget - fixed; head_gpu, n = False, 0
     if remaining > head_stream:
         n = int((remaining - head_stream) // blk_res); n = max(0, min(N_LAYERS, n))
-        if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res: head_gpu = True
+        if n == N_LAYERS and remaining >= N_LAYERS * blk_res + head_res:
+            head_gpu = True
+        elif remaining >= head_res + blk_res:
+            # Keeping the head on the GPU is cheaper than offloading it and
+            # copying it back every step; stream the blocks that do not fit.
+            n = max(0, min(N_LAYERS - 1, int((remaining - head_res) // blk_res)))
+            head_gpu = True
     if backend_name == "DIRECTML": head_gpu, n = False, min(n, 2)
     return head_gpu, n, lc
 
@@ -1699,17 +1733,27 @@ class EngramMemory(nn.Module):
         out = cr[inv].view(idx.shape[0], idx.shape[1], DIM)
         return out.to(self.device)
 
-def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+def _streamed_block_params(block, dev, dtype):
     if dtype is not None:
-        params = {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+        return {n: (p.to(dev, dtype=dtype) if p.dim() > 1 else p.to(dev)) for n, p in block.named_parameters()}
+    return {n: p.to(dev) for n, p in block.named_parameters()}
+
+def _streamed_block(block, dev, dtype, x, cos, sin, use_chunked):
+    params = _streamed_block_params(block, dev, dtype)
+    if dtype is not None:
         with torch.autocast(device_type=dev.type, dtype=dtype):
             return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
-    params = {n: p.to(dev) for n, p in block.named_parameters()}
+    return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
+
+def _streamed_block_cached(block, params, dev, dtype, x, cos, sin, use_chunked):
+    if dtype is not None:
+        with torch.autocast(device_type=dev.type, dtype=dtype):
+            return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
     return torch.func.functional_call(block, params, (x, cos, sin, use_chunked))
 
 class SotaGPT(nn.Module):
     def __init__(self, bn, device, gpu_layers=None, bs=1, sl=MAX_SEQ_LEN,
-                 u8_override=None, act_bytes_override=None):
+                 u8_override=None, act_bytes_override=None, force_head_cpu=False):
         super().__init__()
         self.main_device = device; self.accel_device = device; self.cpu_device  = torch.device('cpu'); self.backend_name = bn
         is_cpu = (device is None) or (device.type == 'cpu')
@@ -1717,7 +1761,7 @@ class SotaGPT(nn.Module):
             u8 = u8_override if u8_override is not None else (
                 has_bitsandbytes() and device is not None and device.type in ('cuda',))
             head_gpu, gpu_layers, self.loss_chunk_hint = _plan_placement(
-                device, bn, memory_config["ram_gb"], bs=bs, sl=sl,
+                device, bn, _placement_budget_gb(), bs=bs, sl=sl,
                 u8=u8, act_bytes=act_bytes_override,
             )
         else:
@@ -1725,6 +1769,18 @@ class SotaGPT(nn.Module):
         self.gpu_layers = 0 if is_cpu else max(0, min(N_LAYERS, int(gpu_layers)))
         self.gpu_layer_set = set(range(self.gpu_layers))
         self.head_on_gpu = bool(head_gpu) and not is_cpu
+        # Caching streamed parameter copies removes the duplicate H2D copy that
+        # checkpoint recompute would otherwise repeat. It costs ~849 MB on the
+        # default model, so only do it when the budget leaves real headroom.
+        self.cache_streamed_params = False
+        if not is_cpu and self.gpu_layers < N_LAYERS:
+            try:
+                _u8 = u8_override if u8_override is not None else (
+                    has_bitsandbytes() and device is not None and device.type in ('cuda', 'rocm'))
+                spare = memory_config["ram_gb"] * 1024 ** 3 - estimate_vram_bytes(bs, sl, _u8)
+                self.cache_streamed_params = spare > 2.5 * 1024 ** 3
+            except Exception:
+                self.cache_streamed_params = False
         self.wte = nn.Embedding(VOCAB_SIZE, DIM); self.engram = EngramMemory(bn, device)
         self.blocks = nn.ModuleList([Block() for _ in range(N_LAYERS)])
         self.ln_f = nn.LayerNorm(DIM); self.lm_head = nn.Linear(DIM, VOCAB_SIZE, bias=False)
@@ -1780,7 +1836,11 @@ class SotaGPT(nn.Module):
                 if use_ckpt: x = checkpoint(block, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
                 else: x = block(x, cos, sin, use_chunked)
             else:
-                x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                if getattr(self, 'cache_streamed_params', False):
+                    params = _streamed_block_params(block, dev, stream_dtype)
+                    x = checkpoint(_streamed_block_cached, block, params, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
+                else:
+                    x = checkpoint(_streamed_block, block, dev, stream_dtype, x, cos, sin, use_chunked, use_reentrant=False, preserve_rng_state=False)
         return self.ln_f(x)
 
     def forward(self, idx, use_chunked=True, use_ckpt=True): return F.linear(self.forward_features(idx, use_chunked, use_ckpt), self.head_weight())
@@ -1915,7 +1975,7 @@ def _register_error_code(r):
 
 def do_register(srv, u, email, p):
     try:
-        r = requests.post(f"{srv}/auth/register", json={"username": u, "password": p, "email": email}, timeout=30)
+        r = requests.post(f"{srv}/auth/register", json={"username": u, "password": p, "emaiclient.pyl": email}, timeout=30)
         if r.status_code == 200:
             try:
                 tok = r.json().get("token")
@@ -2152,7 +2212,7 @@ def _download_file_with_progress(url, dest, emit, stop_evt, expected_size=None, 
             os.replace(tmp, dest); return dest
         try:
             hdrs = {"Range": f"bytes={done}-"} if done > 0 else {}
-            r = requests.get(url, headers=hdrs, stream=True, timeout=(15, 3600), allow_redirects=True)
+            r = requests.get(url, headers=hdrs, stream=True, timeout=(STREAM_CONNECT_TIMEOUT, STREAM_READ_TIMEOUT), allow_redirects=True)
             if r.status_code == 416:
                 if expected is not None and done >= expected:
                     os.replace(tmp, dest); return dest
@@ -2202,7 +2262,7 @@ def fetch_task(srv, h, prec, se, emit, hb=None):
             emit('status', 'downloading')
             emit('overlay_show', {'title_key': 'dl_weights', 'indeterminate': False})
             req_headers = {**(h or {}), **_hardware_headers()}
-            r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(15, 3600), stream=True)
+            r = requests.get(f"{srv}/fl/task?format={prec}", headers=req_headers, timeout=(STREAM_CONNECT_TIMEOUT, STREAM_READ_TIMEOUT), stream=True)
             if r.status_code == 401:
                 r.close()
                 emit('log', "⚠️ auth rejected (401) — clearing the saved session")
@@ -2236,25 +2296,26 @@ def fetch_task(srv, h, prec, se, emit, hb=None):
                 continue
             cl_total = int(r.headers.get('content-length', 0) or 0)
             total = cl_total if cl_total > 0 else EXPECTED_WEIGHT_BYTES
-            chunks = []; done = 0; last = 0.0
+            # One buffer, no list + join + full-payload slice: the inline
+            # payload is ~1.9 GiB, and the old path held two copies at once.
+            buf = bytearray(); done = 0; last = 0.0
             for chunk in r.iter_content(chunk_size=512 * 1024):
                 if not chunk: continue
                 if se.is_set() or (hb and hb.should_stop()):
                     r.close()
                     raise KeyboardInterrupt("Stop requested")
-                chunks.append(chunk); done += len(chunk)
+                buf.extend(chunk); done += len(chunk)
                 now = time.time()
                 if now - last > 0.25:
                     emit('overlay_progress', {'done': done, 'total': total}); last = now
             r.close()
             emit('overlay_progress', {'done': done, 'total': total}); emit('overlay_hide', {}); emit('status', 'preparing')
-            raw = b"".join(chunks); del chunks
-            if len(raw) < 4:
-                emit('log', f"/fl/task returned only {len(raw)} bytes; retrying"); time.sleep(5); continue
-            ml = struct.unpack('<I', raw[:4])[0]
-            if 4 + ml > len(raw):
+            if len(buf) < 4:
+                emit('log', f"/fl/task returned only {len(buf)} bytes; retrying"); time.sleep(5); continue
+            ml = struct.unpack('<I', buf[:4])[0]
+            if 4 + ml > len(buf):
                 emit('log', f"Truncated header; retrying"); time.sleep(5); continue
-            md = json.loads(raw[4:4 + ml].decode()); wb = raw[4 + ml:]
+            md = json.loads(bytes(buf[4:4 + ml]).decode()); wb = memoryview(buf)[4 + ml:]
             emit('log', f"/fl/task inline: metadata OK, weights={len(wb):,} bytes")
             if len(wb) < EXPECTED_WEIGHT_BYTES:
                 emit('log', f"⚠️ inline truncated at {len(wb):,}; retrying"); time.sleep(10); continue
@@ -2351,7 +2412,7 @@ def _fwl(m, x, y, sl, ua, ad, ls=1.0, preview=False, loss_chunk=LOSS_CHUNK):
     sd = ad if ua else None; nc = max(1, math.ceil(sl / loss_chunk))
     def compute():
         w = m.head_weight(sd)
-        xe = m.forward_features(x, use_chunked=True, use_ckpt=True, stream_dtype=sd, head_w=w)
+        xe = m.forward_features(x, use_chunked=True, use_ckpt=bool(getattr(m, 'use_ckpt', True)), stream_dtype=sd, head_w=w)
         y_dev = y.to(xe.device)
         lo = sum(checkpoint(_chunk_ce, xe[:, i:i + loss_chunk, :], w, y_dev[:, i:i + loss_chunk], use_reentrant=False, preserve_rng_state=False) for i in range(0, sl, loss_chunk)) / nc
         return lo, xe, w
@@ -2388,6 +2449,10 @@ def _clear_accel_cache(device):
         elif device is not None and device.type == 'xpu': torch.xpu.empty_cache()
     except Exception: pass
     gc.collect()
+
+def _oom_rung_changes_placement(stage):
+    """Rungs 4/5 only shrink the loss chunk; rebuilding Adam would lose its moments."""
+    return int(stage) not in (4, 5)
 
 class DegradeLadder:
     def __init__(self, model, on_step_down=None):
@@ -2436,6 +2501,13 @@ def _train_step_safe(model, x, y, sl, ua, ad, ls, preview, ladder, emit):
         except RuntimeError as e:
             if not _is_oom(e): raise
             emit('log', f"💥 OOM detected: {str(e).splitlines()[0]}"); _clear_accel_cache(model.accel_device)
+            # Checkpointing is the cheapest rung: restore it before giving up GPU
+            # residency or lowering the batch size.
+            if not getattr(model, 'use_ckpt', True):
+                model.use_ckpt = True
+                for p in model.parameters(): p.grad = None
+                emit('log', "   re-enabled activation checkpointing; retrying same batch")
+                continue
             # A backward that died mid-flight can leave partially written grads. Drop every
             # parameter's grad (including sparse engram rows) before retrying; optimizers keep
             # their Adam moments, so no rebuild is needed. This also discards grads accumulated
@@ -2513,9 +2585,10 @@ def chunked_submit_delta(srv, h, delta_path, meta, emit, se):
             raise
 
 def _build_model(bn, device, iw, ie, emit, bs=1, sl=MAX_SEQ_LEN,
-                 u8_override=None, act_bytes_override=None):
+                 u8_override=None, act_bytes_override=None, force_head_cpu=False):
     model = SotaGPT(bn, device, gpu_layers=None, bs=bs, sl=sl,
-                    u8_override=u8_override, act_bytes_override=act_bytes_override)
+                    u8_override=u8_override, act_bytes_override=act_bytes_override,
+                    force_head_cpu=force_head_cpu)
     model.engram.table.to('cpu'); model.load_base_weights(iw)
     if ENGRAM_ACTIVE and ie is not None: model.engram.table.weight.data.copy_(ie.view(model.engram.table.weight.shape))
     model.engram.table.to('cpu'); model.train(); return model
@@ -2630,6 +2703,9 @@ _upload_thread = None
 # Set only while the single background uploader runs, so the upload function
 # keeps its existing call signature (and its tests stay honest).
 _upload_timing = None
+# Uploads are aborted only on a real hard shutdown, never by pause/Stop: a
+# paused training loop must not kill a POST that already owns a finished round.
+_UPLOAD_ABORT = threading.Event()
 
 def _upload_active():
     t = _upload_thread
@@ -2639,7 +2715,9 @@ def _wait_for_upload(se, emit=None, poll=0.5, hb=None):
     """Block until the in-flight upload (if any) finishes. Returns False if stopped (or refused, via hb) first."""
     announced = False
     while _upload_active():
-        if se.is_set() or (hb is not None and hb.rejected is not None): return False
+        # A training pause/Stop must not cancel an upload; only a coordinator
+        # refusal makes this round's delta not worth writing.
+        if hb is not None and hb.rejected is not None: return False
         if emit is not None and not announced:
             emit('log', "⏳ Previous upload still in progress; this round's delta will upload right after it."); emit('status', 'waiting'); announced = True
         time.sleep(poll)
@@ -2858,9 +2936,11 @@ def run_single_round_wrapper(srv, at, se, emit):
 
         _bs_est = recommend_batch_size(sl, force_mode=optim_mode)
         bs = _bs_est
+        predegrade = False
         if cohort_mode and cc_bs and int(cc_bs) > 0:
-            if int(cc_bs) > _bs_est:
-                emit('log', f"[COHORT] ⚠️ target bs={cc_bs} exceeds local estimate (bs={_bs_est}); will attempt with layout degradation")
+            predegrade = _cohort_predegrade(cc_bs, _bs_est)
+            if predegrade:
+                emit('log', f"[COHORT] target bs={cc_bs} exceeds local estimate (bs={_bs_est}); pre-degrading the head placement")
             bs = int(cc_bs)
 
         model = None
@@ -2873,6 +2953,7 @@ def run_single_round_wrapper(srv, at, se, emit):
                 model = _build_model(
                     train_backend, train_device, iw, ie, emit, bs=bs, sl=sl,
                     u8_override=_u8_override, act_bytes_override=_act_bytes_override,
+                    force_head_cpu=predegrade,
                 )
                 break
             except RuntimeError as e:
@@ -2893,6 +2974,9 @@ def run_single_round_wrapper(srv, at, se, emit):
             nonlocal ob, oe
             if cohort_mode and _ladder.stage >= 6:
                 raise CohortAbort("OOM: would require CPU-only fallback in cohort mode")
+            if not _oom_rung_changes_placement(_ladder.stage):
+                emit('log', "   reduced loss chunk; keeping optimizer state")
+                return
             # Preserve optim_mode: flipping back to native mid-round would submit a delta trained
             # with the wrong optimizer for the pool, silently failing cross-check
             ob, oe = _build_optimizers(model, lr=1e-4, force_mode=optim_mode); emit('log', "   rebuilt optimizers for new placement")
@@ -3876,7 +3960,7 @@ def _tui_enabled(args):
         return False
 
 _HEADLESS_EXIT_MESSAGES = {
-    2: "Authentication failed or no saved session. Pass --user/--password or sign in with the desktop app.",
+    2: "Authentication failed or no saved session. Run --login, pass --user/--password, or sign in with the desktop app.",
     3: "Backend setup failed.",
     5: "Could not fetch task metadata from the coordinator.",
     6: "The coordinator rejected this client's architecture.",
@@ -3886,6 +3970,7 @@ def parse_args():
     p = argparse.ArgumentParser(prog="client.py", description="CrowdGPT client. Runs GUI by default; use --headless for SSH/servers.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--headless", action="store_true", help="no window; train in the terminal")
     p.add_argument("--register", action="store_true", help="create an account, save the session, and exit")
+    p.add_argument("--login", action="store_true", help="log in with --user, save the session, and exit")
     p.add_argument("--server", default=DEFAULT_SERVER, help="coordinator URL")
     p.add_argument("--user", default=None, help="username")
     p.add_argument("--email", default=None, help="email for --register (or env CROWDGPT_EMAIL)")
@@ -4021,7 +4106,7 @@ def _run_headless(args, emit, dashboard=None, control=None):
                     auth_token = saved.get("token")
         except Exception: pass
         if not auth_token:
-            log.error("[auth] no saved session for this server; run --register or pass --user/--password.")
+            log.error("[auth] no saved session for this server; run --login, --register or pass --user/--password.")
             return 2
 
     selected = args.backend if args.backend and args.backend != "auto" else None
@@ -4204,6 +4289,35 @@ def run_register(args):
     print(f"Registered {username} on {args.server}. Session saved for headless training.")
     return 0
 
+def run_login(args):
+    username = (args.user or "").strip()
+    password = args.password or os.environ.get("CROWDGPT_PASSWORD")
+    if not username:
+        log.error("Login needs --user.")
+        return 2
+    if password is None:
+        if not sys.stdin.isatty():
+            log.error("Login needs --password or CROWDGPT_PASSWORD when stdin is not a terminal.")
+            return 2
+        try:
+            password = getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt):
+            log.error("Login cancelled.")
+            return 130
+    token, err = do_login(args.server, username, password)
+    if not token:
+        # do_login reports every non-200 reply as invalid_credentials, including 429 and 5xx.
+        reason = "cannot reach the coordinator" if err == "network" else "the coordinator rejected the login"
+        log.error(f"Login failed: {reason}.")
+        return 1
+    try:
+        _save_auth_token(args.server, username, token, True)
+    except Exception as exc:
+        log.error(f"Logged in, but the session could not be saved: {exc}")
+        return 1
+    print(f"Logged in as {username} on {args.server}. Session saved for headless training.")
+    return 0
+
 if __name__ == "__main__":
     args = parse_args()
     if args.debug: logging.getLogger().setLevel(logging.DEBUG)
@@ -4215,6 +4329,8 @@ if __name__ == "__main__":
         sys.exit(run_doctor(args))
     if args.register:
         sys.exit(run_register(args))
+    if args.login:
+        sys.exit(run_login(args))
     if sys.platform == "win32":
         try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Vxtzq.CrowdGPT.1")
         except Exception: pass
