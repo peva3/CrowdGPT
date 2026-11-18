@@ -217,3 +217,22 @@ parameter updates (per-parameter). Note also that in the distributed setting a
 round's slices run on different volunteers in parallel, so a MOSAIC round costs
 one slice's wall-clock time for `slices` slices' worth of compute — the reason
 the method exists at all.
+
+## Noise floor (why every claim below is quoted to 0.1 nats)
+
+The harness is deterministic by construction: `build()` calls
+`torch.manual_seed(0)` before constructing the model, and `batch(step)` draws from
+`torch.Generator().manual_seed(step * 1_000_003 + 7919)`, so two runs of the same
+command see the same init and the same token streams. Anything that still differs
+is CUDA kernel nondeterminism, not data.
+
+That matters because two arms which are *supposed* to be identical differed by
+0.13 nats at H=1 (6.4651 vs 6.3344). Both were `--trunk-owner last`; in that
+configuration the `share_trunk` clause is a no-op, because `wte` already belongs to
+the terminal slice and the `if n not in {...}` guard skips it. Either a detail
+differs or the run-to-run spread at 65 M / 488 rounds is of that order.
+
+Until a repeat arm measures it, treat differences under ~0.15 nats as unresolved,
+and the genuine "both roles" configuration -- `--trunk-owner first --share-trunk`,
+where `wte` is the embedding to slice 0 *and* the readout to the last slice -- as
+unmeasured.
