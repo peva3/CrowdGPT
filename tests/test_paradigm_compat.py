@@ -166,5 +166,7 @@ def test_mosaic_slices_are_name_based_so_relora_wrapping_cannot_break_them():
     assert slice_of("blocks.0.lin.weight", splits) == 0
     assert slice_of("blocks.0.lin.base.weight", splits) == 0
     assert slice_of("blocks.3.lin.B", splits) == 1
-    assert slice_of("ln_f.weight", splits) is None
+    # the trunk ends belong to slices too, otherwise wte/ln_f never train
+    assert slice_of("wte.weight", splits) == 0
+    assert slice_of("ln_f.weight", splits) == 1
     assert DIM > 0  # imported for the shared tiny model

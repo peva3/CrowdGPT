@@ -36,6 +36,13 @@ class MosaicConfig:
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
     clip_median: bool = True
+    # Per-tensor relative step (LARS in spirit). The slices have wildly different
+    # scales -- an embedding row, an attention matrix and a LayerNorm gain do not
+    # share a useful absolute step -- so one global outer_lr over-steps some
+    # tensors and under-steps others. With trust_ratio every tensor's step is
+    # rescaled to the tensor's own RMS, which makes ``outer_lr`` a *relative*
+    # step size (use ~1e-3, not ~1.0).
+    trust_ratio: bool = False
 
     def __post_init__(self) -> None:
         if self.slices < 2:
@@ -54,7 +61,22 @@ class MosaicState:
 
 
 def slice_of(name: str, slices: list[tuple[int, int]]) -> int | None:
-    """Which slice a parameter name belongs to (``None`` for the readout/trunk)."""
+    """Which slice a parameter name belongs to (``None`` for local-only tensors).
+
+    Non-block parameters have to belong to a slice as well. They used to return
+    ``None``, which excluded ``wte`` and ``ln_f`` from every slice's optimiser --
+    and since the readout is tied to ``wte``, the model trained a representation
+    against a readout that stayed at its random initialisation for the whole run.
+    A frozen random readout puts a floor under the loss (we measured ~7.45-7.57
+    against 5.52-5.63 for SOLO/backprop at 65 M), and no amount of inner lr,
+    outer momentum or head training could move it. The embedding (and therefore
+    the tied readout) belongs to the first slice, the final norm and any untied
+    readout to the last; both are uploaded like any other slice tensor.
+    """
+    if name.startswith("wte."):
+        return 0
+    if name.startswith("ln_f.") or name.startswith("lm_head."):
+        return len(slices) - 1
     if not name.startswith("blocks."):
         return None
     try:
@@ -109,6 +131,11 @@ def aggregate(current: dict[str, torch.Tensor], deltas: list[dict[str, torch.Ten
         prev = state.prev.get(name)
         step = mean if prev is None else mean + cfg.outer_momentum * (mean - prev)
         base = current.get(name)
+        if cfg.trust_ratio and base is not None:
+            rms_step = torch.sqrt((step.float() ** 2).mean())
+            rms_base = torch.sqrt((base.float() ** 2).mean())
+            if float(rms_step) > 0.0 and float(rms_base) > 0.0:
+                step = step * (rms_base / rms_step)
         # MOSAIC uploads are deltas (theta_k - theta), so the merge ADDS them.
         # Subtracting would move the model away from every slice's training.
         out[name] = (base if base is not None else torch.zeros_like(mean)) + cfg.outer_lr * step
@@ -117,35 +144,82 @@ def aggregate(current: dict[str, torch.Tensor], deltas: list[dict[str, torch.Ten
 
 
 def local_delta(model, *, slices: list[tuple[int, int]], k: int, x, y, steps: int,
-                lr: float, loss_chunk: int = 256) -> dict[str, torch.Tensor]:
+                lr: float, loss_chunk: int = 256,
+                opt_state: dict | None = None,
+                share_trunk: bool = False) -> dict[str, torch.Tensor]:
     """Train slice ``k`` for ``steps`` local AdamW steps; return its weight delta.
 
     A non-terminal slice learns through its SOLO head against a detached copy of the
     readout (no gradient crosses slices); the terminal slice uses the true loss.
+
+    ``opt_state`` lets the slice's AdamW state survive between rounds. Without it a
+    fresh optimiser is built per call, and at one local step that is not AdamW at
+    all: the first step of Adam is ``lr * sign(grad)`` because the bias correction
+    cancels the moments, so a one-step round degenerates to sign-SGD with no
+    momentum or second-moment memory. A volunteer trains the same slice round after
+    round, exactly like the production client (which builds its optimisers once),
+    so pass a dict and it will be reused per slice ``k``.
     """
     if not 0 <= k < len(slices):
         raise MosaicError(f"slice {k} outside {len(slices)}")
     lo, hi = slices[k]
     terminal = k == len(slices) - 1
     params = [(n, p) for n, p in model.named_parameters() if slice_of(n, slices) == k]
+    if k == len(slices) - 1 and share_trunk:
+        # The readout is `lm_head.weight is wte.weight`. One tensor, two roles: the
+        # first slice trains it as an embedding through its local head, the terminal
+        # slice needs it as the output layer under the true loss. Owning it from one
+        # side only leaves the other role untrained -- measured at 65 M as 7.25 (both
+        # roles on slice 0) vs 6.47 (readout only) vs 5.63 for backprop, so the two
+        # roles are worth ~0.8 nats. `aggregate` averages a tensor that appears in
+        # two slices' deltas, so sharing costs no wire mechanism, only half a step
+        # per role per round.
+        shared = [(n, p) for n, p in model.named_parameters() if n.startswith("wte.")]
+        params = params + [(n, p) for n, p in shared if n not in {m for m, _ in params}]
     if not params:
         raise MosaicError(f"slice {k} has no parameters")
     if not terminal and (not hasattr(model, "solo_heads") or str(k) not in model.solo_heads):
         raise MosaicError(f"slice {k} needs a SOLO head; call attach() first")
 
-    before = {n: p.detach().clone() for n, p in params}
-    opt = torch.optim.AdamW([p for _, p in params], lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
     head = None if terminal else model.solo_heads[str(k)]
+    # The head is the slice's only teacher, so it has to learn *with* the slice.
+    # `slice_of` classifies by `blocks.<i>.` prefix and therefore never matches
+    # `solo_heads.<k>.*`: training only the slice left every non-terminal module
+    # chasing a frozen random projection, which is what a MOSAIC run looks like
+    # when it plateaus ~1.5 nats behind backprop. Heads are local, so they are
+    # optimised but never returned in the delta.
+    trained = list(params)
+    if head is not None:
+        trained += [(f"solo_heads.{k}.{n}", p) for n, p in head.named_parameters()]
+    before = {n: p.detach().clone() for n, p in params}
+    if opt_state is None:
+        opt = torch.optim.AdamW([p for _, p in trained], lr=lr, betas=(0.9, 0.95),
+                                weight_decay=0.01)
+    else:
+        opt = opt_state.get(k)
+        if opt is None:
+            opt = torch.optim.AdamW([p for _, p in trained], lr=lr, betas=(0.9, 0.95),
+                                    weight_decay=0.01)
+            opt_state[k] = opt
+        else:
+            for group in opt.param_groups:
+                group["lr"] = lr
     for _ in range(steps):
         opt.zero_grad(set_to_none=True)
-        h = model.run_blocks(model.embed(x), 0, hi)
+        # Earlier slices are input, not student: run them without a graph. This
+        # is what slicing is for (no gradient crosses a module boundary) and it
+        # is bit-identical for this slice's gradients, since none of its
+        # parameters appear upstream of `lo`.
+        with torch.no_grad():
+            h0 = model.run_blocks(model.embed(x), 0, lo)
+        h = model.run_blocks(h0, lo, hi)
         if terminal:
             loss = chunked_solo_ce(model.ln_f(h), model.head_weight(), y, pos_step=loss_chunk)
         else:
             loss = chunked_solo_ce(head.project(h), model.head_weight().detach(), y,
                                    tau=head.tau, bias=head.bias, pos_step=loss_chunk)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([p for _, p in params], 1.0)
+        torch.nn.utils.clip_grad_norm_([p for _, p in trained], 1.0)
         opt.step()
     return {n: (p.detach() - before[n]) for n, p in params}
 

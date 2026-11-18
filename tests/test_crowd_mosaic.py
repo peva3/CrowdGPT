@@ -39,11 +39,19 @@ def test_attach_covers_every_block_and_builds_k_minus_one_heads():
     assert sorted(i for lo, hi in info["slices"] for i in range(lo, hi)) == [0, 1, 2, 3]
 
 
-def test_slice_of_maps_blocks_and_ignores_the_readout():
+def test_slice_of_maps_blocks_and_assigns_the_trunk_ends():
+    """Every trained tensor needs a slice.
+
+    Returning None for the trunk used to freeze ``wte`` (and the readout tied to
+    it) plus ``ln_f`` for an entire run, which capped the loss near log(V).
+    """
     splits = [(0, 2), (2, 4)]
     assert slice_of("blocks.0.lin.weight", splits) == 0
     assert slice_of("blocks.3.lin.weight", splits) == 1
-    assert slice_of("lm_head.weight", splits) is None
+    assert slice_of("wte.weight", splits) == 0
+    assert slice_of("ln_f.weight", splits) == 1
+    assert slice_of("lm_head.weight", splits) == 1
+    assert slice_of("solo_heads.0.phi.weight", splits) is None
     assert slice_of("blocks.x.lin.weight", splits) is None
 
 
@@ -84,8 +92,57 @@ def test_local_delta_touches_only_its_slice():
     x, y = _batch(2, 4)
     delta = local_delta(model, slices=model.mosaic_splits, k=0, x=x, y=y, steps=2, lr=1e-2,
                         loss_chunk=4)
-    assert delta and all(n.startswith("blocks.0") or n.startswith("blocks.1") for n in delta)
+    assert delta and all(n.startswith(("blocks.0", "blocks.1", "wte.")) for n in delta)
     assert any(float(v.abs().sum()) > 0 for v in delta.values())
+    # slice 0 owns the embedding (and with it the tied readout)
+    assert any(n.startswith("wte.") for n in delta)
+    assert not any(n.startswith(("ln_f.", "solo_heads.")) for n in delta)
+
+
+def test_share_trunk_lets_the_terminal_slice_train_the_tied_readout():
+    """``lm_head.weight is wte.weight``: one tensor, two roles.
+
+    Owning it from the first slice alone leaves the readout trained only by a
+    local surrogate; owning it from the last slice alone leaves the embedding
+    trained only by the output loss. ``share_trunk`` gives it to both, and
+    ``aggregate`` averages the two deltas because they are ``theta_k - theta``.
+    """
+    model = _Forwarding(modules=2)
+    attach(model, MosaicConfig(slices=2, local_steps=2))
+    slices = model.mosaic_splits
+    x, y = _batch(2, 4)
+
+    alone = local_delta(model, slices=slices, k=1, x=x, y=y, steps=1, lr=1e-3, loss_chunk=4)
+    assert not any(n.startswith("wte.") for n in alone), "terminal slice owns the readout only when asked"
+
+    shared = local_delta(model, slices=slices, k=1, x=x, y=y, steps=1, lr=1e-3, loss_chunk=4,
+                         share_trunk=True)
+    assert "wte.weight" in shared
+    assert any(n.startswith("ln_f.") for n in shared)
+    assert not any(n.startswith(("solo_heads.", "blocks.0.")) for n in shared)
+
+
+def test_local_delta_trains_the_solo_head_but_never_uploads_it():
+    """The gradient for a slice's SOLO head must reach its own weights.
+
+    ``slice_of`` classifies by the ``blocks.<i>.`` prefix, so a naive
+    ``params = [p for n, p in model.named_parameters() if slice_of(n, ...) == k]``
+    silently drops the head: the loss still backpropagates into it, and then the
+    optimizer never applies that gradient. Every non-terminal slice then trains
+    against a frozen random projection, which is what made MOSAIC plateau while
+    backprop kept descending (measured at 306 M: 7.2270 vs 5.6862).
+    """
+    model = _Forwarding(modules=2)
+    attach(model, MosaicConfig(slices=2, local_steps=2))
+    head = model.solo_heads["0"]
+    before = {n: p.detach().clone() for n, p in head.named_parameters()}
+    x, y = _batch(2, 4)
+    delta = local_delta(model, slices=model.mosaic_splits, k=0, x=x, y=y, steps=3, lr=1e-2,
+                        loss_chunk=4)
+    moved = {n: float((p.detach() - before[n]).abs().max()) for n, p in head.named_parameters()}
+    assert all(v > 0 for v in moved.values()), f"head weights did not move: {moved}"
+    # ... but the head is client-local: it must never appear in the uploaded delta.
+    assert not any("solo_heads" in n for n in delta)
 
 
 def test_config_and_slice_bounds_are_validated():

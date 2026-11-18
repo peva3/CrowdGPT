@@ -89,3 +89,34 @@ def test_unknown_and_invalid_configs_are_rejected():
         select("relora", relora_rank=0)
     assert PARADIGMS == ("backprop", "solo", "relora", "dust", "mosaic")
     assert PENDING == ()
+
+
+def test_mosaic_share_trunk_reaches_the_local_step(monkeypatch):
+    """The knob has to reach `local_delta`, or it is a config field nobody reads.
+
+    The tied readout is one tensor with two roles (embedding + output layer), so
+    the terminal slice has to be allowed to train it as well; measured at 65 M as
+    0.78 nats. Assert the flag is forwarded and that it is off by default, so the
+    shipped behaviour does not change silently.
+    """
+    import crowd_mosaic
+
+    seen = []
+    real = crowd_mosaic.local_delta
+
+    def spy(model, **kw):
+        seen.append(kw.get("share_trunk"))
+        return real(model, **kw)
+
+    monkeypatch.setattr(crowd_mosaic, "local_delta", spy)
+    # `local_delta` receives the flag on every slice and applies it only on the
+    # terminal one (covered by test_crowd_mosaic), so the propagation check is
+    # that both calls see the configured value.
+    for flag, expected in ((False, [False, False]), (True, [True, True])):
+        seen.clear()
+        model = _Forwarding()
+        p = select("mosaic", mosaic_slices=2, mosaic_local_steps=1,
+                   mosaic_share_trunk=flag)
+        p.attach(model)
+        p.step(model, *_batch(2))
+        assert seen == expected, (flag, seen)

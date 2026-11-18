@@ -118,3 +118,102 @@ would actually start in.
 
 Numbers land here as they finish; the table is updated rather than replaced so the
 correction stays visible.
+
+## Update (same day): the gap was partly a bug, and ownership explains most of it
+
+The 1.5-nat deficit above was not the method. Two defects in
+`crowd_mosaic.py`, both found by probing the code rather than the loss:
+
+1. **The SOLO head was never optimised.** `local_delta` picked its parameters
+   with `slice_of(name) == k`, and `slice_of` only matched `blocks.<i>.`
+   prefixes, so `solo_heads.<k>.*` never entered the optimiser — its gradients
+   were computed and discarded. Cost: **0.035 nats** (7.5999 → 7.5653). Real,
+   but a footnote.
+2. **The trunk ends were never optimised either.** `wte`, `ln_f` and the tied
+   `lm_head` were excluded for the same reason. Because `lm_head.weight is
+   wte.weight`, MOSAIC spent the run training a representation to decode through
+   a **randomly initialised, frozen readout**. This is the big one.
+
+Probe on a finished 65 M MOSAIC run: a fresh linear probe on its own trunk
+reached **6.39** while the model itself reported **7.18** — 0.79 nats of
+information the readout was failing to use. That predicted almost exactly what
+fixing the ownership recovered.
+
+### Measured, 65 M / 2 M unique tokens / 488 rounds (backprop = 5.6340)
+
+| arm | trunk→slice 0 | trunk→last slice |
+|---|---|---|
+| MOSAIC H=1 (3e-3 / 0.7 / 0.9) | 7.2456 | **6.4651** (−0.78) |
+| MOSAIC H=5 (1e-3 / 1.0 / 0.9) | 7.1728 | **6.1281** (−1.04) |
+| backprop | 5.6340 | — |
+| SOLO (same split, same local law) | 5.5180 | — |
+
+Two things follow. Giving the last slice `wte` means the terminal slice's *true*
+cross-entropy trains the readout, which is the role it plays under SOLO where one
+optimiser covers both. And local steps finally pay: H=5 beats H=1 by 0.34 nats,
+where before the fix it bought 0.07.
+
+What remains — 0.49 nats at H=5 — is trunk quality, which matches the probe's
+6.39 measurement almost exactly.
+
+### The fix in code
+
+`slice_of` now assigns `wte.` to slice 0 and `ln_f.` / `lm_head.` to the last
+slice, and `local_delta(..., share_trunk=True)` additionally gives `wte` to the
+terminal slice so **both** of its roles are trained: embedding through slice 0's
+head, readout through the true loss. `aggregate` already averages a tensor that
+appears in two slices' deltas, so sharing needs no new wire mechanism — only half
+a step per role per round.
+
+## The local-step optimum, and what the fixes are worth
+
+All arms below: 65 M (`--dim 512 --layers 12 --heads 8`, 653 M params at the
+306 M preset's depth/width ratio), 2 M unique tokens, 488 rounds for K=2,
+8 fixed `val.bin` windows, `--inner-state`.
+
+| arm | final | wall |
+|---|---|---|
+| backprop, 2 M tokens (976 steps) | **5.6340** | 75 s |
+| SOLO, 2 M tokens | 5.5180 | 78 s |
+| MOSAIC K=2 H=5, trunk (tied readout) owned by slice 0 | 7.1728 | 231 s |
+| MOSAIC K=2 H=5, readout owned by the last slice | 6.1281 | 231 s |
+| MOSAIC K=2 H=5, readout owned by **both** (`share_trunk`) | **6.1046** | 231 s |
+| MOSAIC K=2 H=1, share_trunk | 6.3344 | 57 s |
+| MOSAIC K=2 H=10 | 6.3883 | 450 s |
+| MOSAIC K=2 H=20 | 6.7522 | 885 s |
+| MOSAIC K=4 H=5 (244 rounds, half the updates) | 6.3306 | 149 s |
+
+Three things to read off it:
+
+1. **Ownership is worth ~0.9 nats.** The tied tensor (`lm_head.weight is
+   wte.weight`) has two roles; giving it to the embedding side left the readout
+   randomly initialised for the whole run. This is the largest single effect we
+   have measured, larger than every hyper-parameter in the table combined.
+2. **H=5 is the optimum.** Local steps beyond that over-train on a single batch
+   and the outer step gets correspondingly larger (H=10 and H=20 both regress,
+   and the curves oscillate).
+3. **K=4 is not comparable here.** `--budget unique` fixes rounds at
+   `tokens/(slices*B*T)`, so four slices in the same 2 M tokens get half the
+   parameter updates. A fair K=4 arm needs 4 M tokens.
+
+## Matched per-parameter data: MOSAIC ties backprop
+
+A MOSAIC round trains every parameter once but spends `slices*B*T` tokens doing
+it, so over a fixed total token budget each parameter sees half the batches
+backprop's parameters see. The matched control is therefore backprop at 1 M
+tokens (488 steps):
+
+| arm | tokens total | per-parameter tokens | final |
+|---|---|---|---|
+| backprop | 1 M | 1 M | 6.1086 |
+| SOLO | 1 M | 1 M | 6.3386 |
+| MOSAIC K=2 H=5, share_trunk | 2 M | 1 M | **6.1046** |
+| backprop | 2 M | 2 M | 5.6340 |
+
+At equal per-parameter data MOSAIC **ties** backprop and beats SOLO. At equal
+total tokens backprop is 0.47 ahead. Both statements are true; which one matters
+depends on whether the budget being spent is volunteer tokens (total) or
+parameter updates (per-parameter). Note also that in the distributed setting a
+round's slices run on different volunteers in parallel, so a MOSAIC round costs
+one slice's wall-clock time for `slices` slices' worth of compute — the reason
+the method exists at all.

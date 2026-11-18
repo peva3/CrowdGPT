@@ -37,6 +37,14 @@ class ParadigmConfig:
     mosaic_slices: int = 2
     mosaic_local_steps: int = 30
     mosaic_inner_lr: float = 3e-3
+    # The readout is `lm_head.weight is wte.weight`, so one tensor has two roles:
+    # the first slice trains it as an embedding, the terminal slice needs it as
+    # the output layer. With share_trunk the terminal slice trains it too, and
+    # `aggregate` averages the two proposals. Measured at 65 M: 7.25 (both roles
+    # on slice 0) vs 6.47 (readout only) vs 5.63 for backprop, so the ownership
+    # is worth ~0.8 nats. Off by default to keep the shipped behaviour until the
+    # combined variant has been measured end to end.
+    mosaic_share_trunk: bool = False
     relora_alpha: float = 1.0
 
     def __post_init__(self) -> None:
@@ -139,7 +147,9 @@ class Paradigm:
             current = {n: p.detach().clone() for n, p in model.named_parameters()}
             deltas = [local_delta(model, slices=splits, k=k, x=x, y=y,
                                   steps=cfg.local_steps, lr=self.type.mosaic_inner_lr,
-                                  loss_chunk=loss_chunk) for k in range(len(splits))]
+                                  loss_chunk=loss_chunk,
+                                  share_trunk=self.type.mosaic_share_trunk)
+                      for k in range(len(splits))]
             new_w, state = aggregate(current, deltas, cfg=cfg,
                                      state=getattr(model, "_mosaic_state", None))
             with __import__("torch").no_grad():
