@@ -69,14 +69,52 @@ outer rule (median clip, slice averaging, `outer_lr=0.7`, momentum 0.9) and the
 SOLO head on slice 0 differ. If H=1 loses to backprop, the rule is the problem;
 if it matches, the local-step data reuse is.
 
+## The fair comparison: equal data, equal gradient steps
+
+`--budget unique`, 2 M tokens, 488 rounds for every H. Backprop's reference row is
+the same 2 M unique tokens and its 976 AdamW steps.
+
+| arm | ¼ | ½ | final | wall | unique tokens | gradient steps |
+|---|---|---|---|---|---|---|
+| backprop | 6.2236 | 5.9203 | **5.6862** | 478.0 s | 1,998,848 | 976 |
+| MOSAIC K=2 H=1 | 7.2958 | 7.2624 | **7.2270** | 402.1 s | 1,998,848 | 976 |
+| MOSAIC K=2 H=5 | 7.3318 | 7.2714 | **7.2285** | 1734.5 s | 1,998,848 | 4,880 |
+
+At H=1 the arms see identical data and take the identical number of gradient
+steps; only the outer rule differs (median clip, mean of slice deltas,
+`outer_lr=0.7`, momentum 0.9) plus the fact that slice 0 trains against a SOLO
+head. MOSAIC ends **1.54 nats behind** (7.2270 vs 5.6862). That is the answer the
+inner-budget runs could not give: the starvation was real, but removing it does
+not close the gap.
+
+Five times the local steps on the same data (H=5 — 4,880 gradient steps, 3.6×
+wall clock) lands within 0.0015 of H=1, i.e. more local work bought nothing, and
+both MOSAIC curves flatten between ½ and final (7.2624 → 7.2270, 7.2714 → 7.2285)
+while backprop is still descending (5.9203 → 5.6862). A curve that plateaus that
+hard is not merely slower; at this slice count, inner lr and outer lr the outer
+loop is not converging.
+
+Caveat, stated rather than buried: K=2 means 12 layers per slice, and slice 0
+trains against a SOLO head initialised at `attach` time, so over 2 M tokens the
+head has little chance to align with the readout. More data, more slices, or a
+warm head could look different. What is measured is the regime a weekend launch
+would actually start in.
+
+## What this means for a launch
+
+- **Backprop is the arm to start a new model with** at this scale.
+- MOSAIC is *verified as wired* — delta layout, slice integrity, both devices —
+  and *not verified as competitive* at 306 M / 2 M tokens.
+- The 40-round tiny-model win in `V2_PARADIGMS.md` is a wiring result; it does not
+  survive a fair 306 M comparison.
+
 ## Status
 
-- CUDA H=30 (`--budget inner`): measured, above.
-- CUDA H=5 (`--budget inner`): measured, above.
-- ROCm 890M (`--budget inner`): running, same configuration.
-- `--budget unique` H=1 and H=5 (CUDA): running — these are the fair comparison.
-- No MOSAIC number here is a verdict on the outer rule yet; only `--budget
-  unique` at H=1 compares the rule on identical data and identical step count.
+- CUDA H=30 and H=5 (`--budget inner`): measured — artifacts of the budget, kept
+  only to show why they looked bad.
+- CUDA H=1 and H=5 (`--budget unique`): measured — the fair comparison above.
+- ROCm 890M (`--budget inner`): still running; will be recorded as another
+  inner-budget artifact, not as a verdict.
 
-Numbers land here as they finish; the table is updated rather than replaced so
-the correction stays visible.
+Numbers land here as they finish; the table is updated rather than replaced so the
+correction stays visible.
