@@ -43,6 +43,8 @@ class MosaicConfig:
     # rescaled to the tensor's own RMS, which makes ``outer_lr`` a *relative*
     # step size (use ~1e-3, not ~1.0).
     trust_ratio: bool = False
+    # Give each auxiliary head a hidden layer (DGL: aux-net capacity matters).
+    head_mlp: bool = False
 
     def __post_init__(self) -> None:
         if self.slices < 2:
@@ -146,7 +148,11 @@ def aggregate(current: dict[str, torch.Tensor], deltas: list[dict[str, torch.Ten
 def local_delta(model, *, slices: list[tuple[int, int]], k: int, x, y, steps: int,
                 lr: float, loss_chunk: int = 256,
                 opt_state: dict | None = None,
-                share_trunk: bool = False) -> dict[str, torch.Tensor]:
+                share_trunk: bool = False,
+                head_lr_mult: float = 1.0,
+                head_skip: bool = False,
+                overlap: int = 0,
+                xy_seq: list | None = None) -> dict[str, torch.Tensor]:
     """Train slice ``k`` for ``steps`` local AdamW steps; return its weight delta.
 
     A non-terminal slice learns through its SOLO head against a detached copy of the
@@ -165,6 +171,21 @@ def local_delta(model, *, slices: list[tuple[int, int]], k: int, x, y, steps: in
     lo, hi = slices[k]
     terminal = k == len(slices) - 1
     params = [(n, p) for n, p in model.named_parameters() if slice_of(n, slices) == k]
+    lo_f, hi_f = lo, hi
+    if overlap:
+        # A harder cut than the method needs: the blocks either side of a slice
+        # boundary are trained by two different local objectives and neither sees
+        # the other's loss. Giving both slices the boundary block lets its
+        # gradient be the average of the two proposals (aggregate already does
+        # that for any tensor present in two deltas).
+        lo_f, hi_f = max(0, lo - overlap), min(len(model.blocks), hi + overlap)
+        have = {n for n, _ in params}
+        for idx in list(range(lo_f, lo)) + list(range(hi, hi_f)):
+            for n, p in model.blocks[idx].named_parameters():
+                full = f"blocks.{idx}.{n}"
+                if full not in have:
+                    params.append((full, p))
+                    have.add(full)
     if k == len(slices) - 1 and share_trunk:
         # The readout is `lm_head.weight is wte.weight`. One tensor, two roles: the
         # first slice trains it as an embedding through its local head, the terminal
@@ -192,36 +213,98 @@ def local_delta(model, *, slices: list[tuple[int, int]], k: int, x, y, steps: in
     if head is not None:
         trained += [(f"solo_heads.{k}.{n}", p) for n, p in head.named_parameters()]
     before = {n: p.detach().clone() for n, p in params}
+    # The head is the teacher, so it has to keep up with the trunk it is teaching.
+    # Measured at 65 M: a fresh decoder fit on MOSAIC's own frozen features
+    # reaches 5.817, while MOSAIC's own head path outputs 6.018 from those same
+    # features -- the online head is worse than a newly fit head of comparable
+    # capacity, which is what a teacher lagging its moving student looks like.
+    # A separate param group lets the head run hotter than the trunk.
+    groups = [{"params": [p for _, p in params], "lr": lr}]
+    if head is not None:
+        head_params = [p for _, p in head.named_parameters()]
+        if float(head_lr_mult) != 1.0:
+            groups.append({"params": head_params, "lr": lr * float(head_lr_mult),
+                           "is_head": True})
+        else:
+            groups[0]["params"].extend(head_params)
     if opt_state is None:
-        opt = torch.optim.AdamW([p for _, p in trained], lr=lr, betas=(0.9, 0.95),
-                                weight_decay=0.01)
+        opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
     else:
         opt = opt_state.get(k)
         if opt is None:
-            opt = torch.optim.AdamW([p for _, p in trained], lr=lr, betas=(0.9, 0.95),
-                                    weight_decay=0.01)
+            opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
             opt_state[k] = opt
         else:
             for group in opt.param_groups:
-                group["lr"] = lr
-    for _ in range(steps):
+                group["lr"] = lr * (float(head_lr_mult) if group.get("is_head") else 1.0)
+    for _s in range(steps):
+        # H steps on one batch is H epochs on 2,048 tokens; `xy_seq` gives each
+        # step its own batch instead, which is what lets a round afford many
+        # local steps without the representation overfitting a single batch.
+        if xy_seq:
+            x_s, y_s = xy_seq[_s % len(xy_seq)]
+        else:
+            x_s, y_s = x, y
         opt.zero_grad(set_to_none=True)
         # Earlier slices are input, not student: run them without a graph. This
         # is what slicing is for (no gradient crosses a module boundary) and it
         # is bit-identical for this slice's gradients, since none of its
         # parameters appear upstream of `lo`.
         with torch.no_grad():
-            h0 = model.run_blocks(model.embed(x), 0, lo)
-        h = model.run_blocks(h0, lo, hi)
+            h0 = model.run_blocks(model.embed(x_s), 0, lo_f)
+        h = model.run_blocks(h0, lo_f, hi_f)
         if terminal:
-            loss = chunked_solo_ce(model.ln_f(h), model.head_weight(), y, pos_step=loss_chunk)
+            loss = chunked_solo_ce(model.ln_f(h), model.head_weight(), y_s,
+                                   pos_step=loss_chunk)
         else:
-            loss = chunked_solo_ce(head.project(h), model.head_weight().detach(), y,
+            # `h0` is a no_grad constant here (earlier slices are input, not
+            # student), so the skip path can see it without reintroducing the
+            # cross-module gradient the method exists to avoid.
+            proj = head.project(h, z=h0) if head_skip else head.project(h)
+            loss = chunked_solo_ce(proj, model.head_weight().detach(), y_s,
                                    tau=head.tau, bias=head.bias, pos_step=loss_chunk)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for _, p in trained], 1.0)
         opt.step()
     return {n: (p.detach() - before[n]) for n, p in params}
+
+
+def fit_head(model, *, slices, k: int, x, y, steps: int = 20, lr: float = 1e-2,
+             loss_chunk: int = 256) -> float:
+    """Re-align slice ``k``'s SOLO head to the trunk as it is *now*.
+
+    The head is the only teacher a non-terminal slice has, and it is trained
+    online while the aggregated trunk keeps moving, so it can lag the student it
+    supervises. Measured at 65 M: a fresh decoder fit on MOSAIC's own frozen
+    features reaches 5.82, while MOSAIC's own head path gives 6.02 on those same
+    features -- the online head is worse than a head fitted to the trunk. Raising
+    its lr made that worse (3x/10x/30x -> 6.14/6.21/6.18 vs 6.08), because a
+    hotter AdamW teacher is noisier rather than better aligned.
+
+    So: freeze the slice, fit the head to convergence, resume. Nothing crosses a
+    module boundary and the head is still client-local, so this changes only how
+    well the teacher tracks the student. Returns the final local loss.
+    """
+    lo, hi = slices[k]
+    if not hasattr(model, "solo_heads") or str(k) not in model.solo_heads:
+        raise MosaicError(f"slice {k} needs a SOLO head; call attach() first")
+    head = model.solo_heads[str(k)]
+    params = [p for p in head.parameters()]
+    # Frozen trunk: earlier slices are input, and this slice must not move while
+    # its teacher catches up.
+    with torch.no_grad():
+        h0 = model.run_blocks(model.embed(x), 0, lo)
+        h = model.run_blocks(h0, lo, hi)
+    opt = torch.optim.AdamW(params, betas=(0.9, 0.95), weight_decay=0.01)
+    w_bar = model.head_weight().detach()
+    loss = None
+    for _ in range(int(steps)):
+        opt.zero_grad(set_to_none=True)
+        loss = chunked_solo_ce(head.project(h), w_bar, y, tau=head.tau,
+                               bias=head.bias, pos_step=loss_chunk)
+        loss.backward()
+        opt.step()
+    return float(loss.detach()) if loss is not None else float("nan")
 
 
 def attach(model, cfg: MosaicConfig = MosaicConfig()) -> dict:
@@ -233,6 +316,7 @@ def attach(model, cfg: MosaicConfig = MosaicConfig()) -> dict:
     vocab = model.wte.weight.shape[0]
     device = model.wte.weight.device
     model.mosaic_splits = splits
-    model.solo_heads = build_solo_heads(dim, vocab, len(splits)).to(device)
+    model.solo_heads = build_solo_heads(dim, vocab, len(splits),
+                                        mlp=cfg.head_mlp).to(device)
     return {"paradigm": "mosaic", "slices": splits, "heads": len(splits) - 1,
             "localSteps": cfg.local_steps}

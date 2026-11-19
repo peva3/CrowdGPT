@@ -25,6 +25,7 @@ Adam moments plus activations does not leave room for evaluation copies on a
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -158,7 +159,11 @@ def run_backprop(tokens, lr=3e-4, eval_every=500_000):
 def run_mosaic(tokens, slices=2, local_steps=30, inner_lr=3e-3,
                outer_lr=0.7, clip=True, eval_every=500_000, budget="unique",
                freeze_head=False, outer_momentum=0.9, inner_state=False,
-               trunk_owner="first", share_trunk=False, trust_ratio=False):
+               trunk_owner="first", share_trunk=False, trust_ratio=False,
+               head_lr_mult=1.0, head_skip=False, overlap=0, head_mlp=False,
+               fresh_local_batches=False, calib_every=0,
+               outer_lr_final=None, schedule="cosine",
+               calib_steps=20, calib_lr=1e-2):
     model = build()
     n = sum(p.numel() for p in model.parameters())
     # Defaults from crowd_paradigm.ParadigmConfig (slices 2, local 30, inner 3e-3),
@@ -167,6 +172,7 @@ def run_mosaic(tokens, slices=2, local_steps=30, inner_lr=3e-3,
     cfg = mosaic_mod.MosaicConfig(slices=slices, local_steps=local_steps,
                                   outer_lr=outer_lr, clip_median=clip,
                                   outer_momentum=outer_momentum,
+                                  head_mlp=head_mlp,
                                   trust_ratio=trust_ratio)
     desc = mosaic_mod.attach(model, cfg)
     # The tied readout IS wte, so whoever owns wte trains the output layer. On the
@@ -192,7 +198,9 @@ def run_mosaic(tokens, slices=2, local_steps=30, inner_lr=3e-3,
     #   "inner"   -> equal *inner-step tokens*: rounds = tokens/(slices*H*B*T),
     #                which silently gives the arm H times fewer unique tokens.
     # Default is "unique"; "inner" is kept only to reproduce the first run.
-    per_round = slices * local_steps * B * T if budget == "inner" else slices * B * T
+    per_round = (slices * local_steps * B * T
+                 if (budget == "inner" or fresh_local_batches)
+                 else slices * B * T)
     rounds = max(1, tokens // per_round)
     curve, seen, nxt = [evaluate(model)], 0, eval_every
     state = None
@@ -206,10 +214,36 @@ def run_mosaic(tokens, slices=2, local_steps=30, inner_lr=3e-3,
         deltas = []
         for k in range(slices):
             x, y = batch(r * slices * local_steps + k * local_steps)
+            xy_seq = ([batch(r * slices * local_steps + k * local_steps + s)
+                       for s in range(local_steps)] if fresh_local_batches else None)
             deltas.append(mosaic_mod.local_delta(model, slices=desc["slices"], k=k, x=x, y=y,
+                                                 xy_seq=xy_seq,
                                                  steps=local_steps, lr=inner_lr,
                                                  opt_state=opt_state,
-                                                 share_trunk=share_trunk))
+                                                 share_trunk=share_trunk,
+                                                 head_lr_mult=head_lr_mult,
+                                                 head_skip=head_skip,
+                                                 overlap=overlap))
+        # Teacher lag: the head is fitted online while the trunk it supervises
+        # keeps moving. Stopping to fit it (trunk frozen) is the cheap fix the
+        # lr sweep pointed at -- see crowd_mosaic.fit_head's docstring.
+        if calib_every and (r + 1) % int(calib_every) == 0:
+            for kk in range(slices - 1):
+                cxk, cyk = batch(50_000_000 + r * slices + kk)
+                mosaic_mod.fit_head(model, slices=desc["slices"], k=kk, x=cxk, y=cyk,
+                                    steps=calib_steps, lr=calib_lr)
+        # The outer rate has an interior optimum (0.15 measured), which usually
+        # means the optimum moves during training: a decaying schedule can spend
+        # the early rounds where a big step is safe and the late rounds where only
+        # a small one is. `cfg` is a frozen dataclass, so rebuild it per round.
+        if outer_lr_final is not None:
+            frac = r / max(1, rounds - 1)
+            if schedule == "cosine":
+                import math as _m
+                o = outer_lr_final + (outer_lr - outer_lr_final) * 0.5 * (1.0 + _m.cos(_m.pi * frac))
+            else:
+                o = outer_lr + (outer_lr_final - outer_lr) * frac
+            cfg = dataclasses.replace(cfg, outer_lr=o)
         new, state = mosaic_mod.aggregate(current, deltas, cfg=cfg, state=state)
         with torch.no_grad():
             for nm, p in model.named_parameters():
@@ -230,7 +264,12 @@ def run_mosaic(tokens, slices=2, local_steps=30, inner_lr=3e-3,
             "rounds": rounds, "gradSteps": rounds * slices * local_steps,
             "slices": desc["slices"], "localSteps": local_steps, "innerLr": inner_lr,
             "frozenHead": bool(freeze_head), "trunkOwner": trunk_owner,
-            "shareTrunk": bool(share_trunk), "trustRatio": bool(trust_ratio), "outerMomentum": outer_momentum,
+            "shareTrunk": bool(share_trunk), "trustRatio": bool(trust_ratio),
+            "headLrMult": float(head_lr_mult), "headSkip": bool(head_skip), "overlap": int(overlap),
+            "headMlp": bool(head_mlp), "freshLocalBatches": bool(fresh_local_batches),
+            "outerLrFinal": outer_lr_final, "schedule": schedule,
+            "calibEvery": int(calib_every), "calibSteps": int(calib_steps),
+            "outerMomentum": outer_momentum,
             "innerState": bool(inner_state),
             "outerLr": outer_lr, "curve": curve, "final": curve[-1],
             "seconds": round(dt, 1), "tokensPerSecond": round(seen / dt), "device": str(DEV)}
@@ -301,6 +340,25 @@ def main():
                     help="per-tensor relative outer step (outer_lr becomes relative)")
     ap.add_argument("--batch", type=int, default=B,
                     help="sequences per local step (default: the preset's B)")
+    ap.add_argument("--outer-lr-final", type=float, default=None,
+                    help="decay the outer rate from --outer-lr to this")
+    ap.add_argument("--schedule", choices=("cosine", "linear"), default="cosine")
+    ap.add_argument("--fresh-local-batches", action="store_true",
+                    help="each inner step trains on its own batch (DiLoCo inner loop)")
+    ap.add_argument("--head-mlp", action="store_true",
+                    help="give each auxiliary head a hidden layer")
+    ap.add_argument("--overlap", type=int, default=0,
+                    help="extra blocks each side of a slice boundary, trained by both")
+    ap.add_argument("--calib-every", type=int, default=0,
+                    help="re-fit each SOLO head to the frozen trunk every N rounds")
+    ap.add_argument("--calib-steps", type=int, default=20,
+                    help="head-only AdamW steps per recalibration")
+    ap.add_argument("--calib-lr", type=float, default=1e-2,
+                    help="lr for head-only recalibration")
+    ap.add_argument("--head-skip", action="store_true",
+                    help="let the SOLO head see the slice input as well as its output")
+    ap.add_argument("--head-lr-mult", type=float, default=1.0,
+                    help="local lr multiplier for the SOLO head (the teacher)")
     ap.add_argument("--share-trunk", action="store_true",
                     help="let the terminal slice train the tied readout too")
     ap.add_argument("--freeze-head", action="store_true",
@@ -336,6 +394,16 @@ def main():
                                   inner_state=a.inner_state,
                                   trunk_owner=a.trunk_owner,
                                   share_trunk=a.share_trunk,
+                                  head_lr_mult=a.head_lr_mult,
+                                  head_skip=a.head_skip,
+                                  overlap=a.overlap,
+                                  head_mlp=a.head_mlp,
+                                  fresh_local_batches=a.fresh_local_batches,
+                                  outer_lr_final=a.outer_lr_final,
+                                  schedule=a.schedule,
+                                  calib_every=a.calib_every,
+                                  calib_steps=a.calib_steps,
+                                  calib_lr=a.calib_lr,
                                   trust_ratio=a.trust_ratio))
         r = results[-1]
         print(f"mosaic(K={a.slices},H={a.local_steps},frozen={int(a.freeze_head)}) curve={['%.4f' % c for c in r['curve']]} "
